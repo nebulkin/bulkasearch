@@ -59,7 +59,7 @@ def score(u: str):
         parts.append(("один символ", 20))
     elif len(core) % 2 == 0 and core[:h] * 2 == core:
         parts.append(("повтор (abab)", 12))
-    elif core == core[::-1]:
+    elif core == core[::-1] and (u in WORDS or u in BRANDS):  # палиндром ценен только у настоящего слова/бренда, не у «каши»
         parts.append(("палиндром", 10))
 
     d = sum(c.isdigit() for c in u)
