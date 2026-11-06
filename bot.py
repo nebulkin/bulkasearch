@@ -130,27 +130,33 @@ async def run_find(target: Message, user, length, mode):
     uid = user.id
     if uid in busy:
         return await target.answer("Предыдущий поиск ещё идёт, подожди немного.")
-    cands = scoring.candidates(length, mode, 40)
+    cands = scoring.candidates(length, mode, 120)
     if not cands:
         return await target.answer("Для такой длины и режима нет кандидатов — попробуй другую.", reply_markup=len_kb(mode))
+    # лучшие по оценке проверяем первыми — первый же свободный сразу отдаём
+    cands.sort(key=lambda x: scoring.score(x)[0], reverse=True)
     busy.add(uid)
     try:
         await db.touch(uid, user.full_name, searched=True)
-        msg = await target.answer(f"🔎 Проверяю {len(cands)} вариантов, ~{len(cands) // 2} сек…")
-        found = []
+        msg = await target.answer("🔎 Ищу свободный ник…")
+        hit, fallback, checked = None, None, 0
         for u in cands:
             st = await checker.check(u)
-            if st in ("free", "fragment"):
-                found.append((scoring.score(u)[0], u, st))
-        found.sort(reverse=True)
+            checked += 1
+            if st == "free":
+                hit = (scoring.score(u)[0], u, st)
+                break
+            if st == "fragment" and fallback is None:
+                fallback = (scoring.score(u)[0], u, st)
         await msg.delete()
-        if not found:
-            return await target.answer("Все проверенные варианты заняты 😕", reply_markup=results_kb([], mode, length))
-        sc, u, st = found[0]
-        lines = "\n".join(f"{'✅' if s == 'free' else '💎'} @{n} — {c}/100" for c, n, s in found[:10])
-        cap = (f"<b>Лучший: @{u}</b>\nНашёл {len(found)} из {len(cands)} · {MODE_NAMES[mode]} · {length} симв.\n\n{lines}\n\n"
-               "Нажми на ник ниже — карточка и действия.")
-        await send_card(target, u, sc, st, cap, results_kb(found, mode, length))
+        best = hit or fallback
+        if not best:
+            return await target.answer(f"Проверил {checked} — все заняты 😕 Нажми «Ещё».", reply_markup=results_kb([], mode, length))
+        sc, u, st = best
+        cap = (f"<b>{'Свободен' if st == 'free' else 'На Fragment'}: @{u}</b> — {sc}/100 {scoring.tier(sc)}\n"
+               f"Проверено: {checked} · {MODE_NAMES[mode]} · {length} симв.")
+        await send_card(target, u, sc, st, cap, nick_kb(u, user.id))
+        await target.answer("Ещё один?", reply_markup=results_kb([], mode, length))
     finally:
         busy.discard(uid)
 
