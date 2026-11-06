@@ -427,7 +427,7 @@ async def pool_cmd(m: Message):
         return await m.answer("Команда только для владельца бота.")
     rows = await db.run("SELECT length, COUNT(*) FROM pool GROUP BY length ORDER BY length", fetch=True)
     stock = ", ".join(f"{n} симв.: {c}" for n, c in rows) or "пусто"
-    await m.answer(f"📦 <b>Склад свободных ников</b>\n{stock}\n\n🤖 <b>Сканеры</b>\n" + "\n".join(scanner.status_lines()) +
+    await m.answer(f"📦 <b>Склад свободных ников</b>\n{stock}\n\n🤖 <b>Сканеры</b>\n" + "\n".join(scanner.status_lines()) + "\n" + scanner.alert_line() +
                    "\n\n🔑 <b>Аккаунты для поиска</b>\n" + "\n".join(acc_lines()) + f"\n\n🗄 База: {db.BACKEND}")
 
 
@@ -500,6 +500,35 @@ async def plain_username(m: Message):
     await do_rate(m, m.from_user, m.text)
 
 
+async def notify_valuable(u: str, sc: int, who: str = "сканер", test: bool = False):
+    """Ценная находка сканера: сразу шлём владельцу карточку с кнопкой «Поставить ник (userbot)»."""
+    try:
+        lo, hi = scoring.estimate_ton(u, sc)
+        png = await asyncio.to_thread(card.render_card, u, sc, "free", lo, hi)
+        head = "🧪 <b>Тест оповещения</b>" if test else "🚨💎 <b>Ценная находка!</b>"
+        cap = (f"{head}\n\n<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n"
+               f"🤖 {who} · свободен прямо сейчас, забирай, пока не заняли!")
+        kb = InlineKeyboardMarkup(inline_keyboard=[HOME_BTN]) if test else nick_kb(u, OWNER_ID)
+        await bot.send_photo(OWNER_ID, BufferedInputFile(png, f"{u}.png"), caption=cap, reply_markup=kb)
+    except Exception:
+        logging.exception("notify_valuable")
+        if not test:  # не вышло отправить — хотя бы не теряем ник, кладём на склад
+            try:
+                await db.run(
+                    "INSERT INTO pool(username,length,score,found) VALUES(?,?,?,?) "
+                    "ON CONFLICT(username) DO UPDATE SET found=excluded.found",
+                    (u, len(u), sc, int(time.time())))
+            except Exception:
+                logging.exception("notify_valuable fallback")
+
+
+@dp.message(Command("testalert"))
+async def testalert_cmd(m: Message):
+    if m.from_user.id != OWNER_ID:
+        return await m.answer("Команда только для владельца бота.")
+    await notify_valuable("bulka", scoring.score("bulka")[0], "тестовый сканер", test=True)
+
+
 async def trap_loop():
     while True:
         await asyncio.sleep(TRAP_INTERVAL)
@@ -550,6 +579,8 @@ async def main():
     except Exception:
         logging.exception("set description")
     await checker.start()
+    if OWNER_ID:
+        scanner.set_alert(notify_valuable)  # ценные находки сканеров — сразу владельцу
     scanner.start_all(os.getenv("TG_SESSION", ""))
     await start_web()
     asyncio.create_task(trap_loop())
