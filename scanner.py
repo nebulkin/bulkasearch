@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 
 from telethon import TelegramClient, errors, functions
@@ -18,6 +19,49 @@ POOL_MAX = int(os.getenv("POOL_MAX", 300))  # столько свободных 
 POOL_LENGTHS = sorted(set(LENGTHS))
 MIN_SCORE = int(os.getenv("POOL_MIN_SCORE", 54))  # слабее этого сканеры даже не проверяют (54 = только слова и бренды)
 seen: dict[str, float] = {}  # общий для всех сканеров список уже проверенных
+
+NEAR_MIN = int(os.getenv("NEAR_MIN_SCORE", 35))  # минимальная оценка «почти-слов»
+_V, _C = "aeiou", "bdfgklmnprstv"
+_BY_LEN: dict[int, list[str]] = {}
+_VPAIRS = {"ea", "ou", "ai", "oo", "ee", "ie", "io", "ia", "ay", "oa", "ui", "ey", "oy", "eu"}
+_CPAIRS = set("bl br ch cl cr dr fl fr gl gr ll nd ng nk nt pl pr rs sh sk sl sm sn sp st sw th tr ss tt rn rt rd rk rm "
+              "lm ld lk lt mp mb nn pp rr ck ft ct tc lv rv".split())
+
+
+def _pretty(u: str) -> bool:
+    """Похоже на английское слово: нет трёх согласных/гласных подряд и странных пар."""
+    if re.search(r"[^aeiouy]{3}|[aeiouy]{3}", u):
+        return False
+    if any(m.group() not in _VPAIRS for m in re.finditer(r"[aeiouy]{2}", u)):
+        return False
+    return all(m.group() in _CPAIRS for m in re.finditer(r"[^aeiouy]{2}", u))
+
+
+def _near_words(n: int, count: int = 30) -> list[str]:
+    """Настоящее слово из словаря с одной буквой заменённой/убранной/добавленной: lumen -> lumon, brava -> brave."""
+    if not _BY_LEN:
+        for w in scoring.WORDS | scoring.BRANDS:
+            _BY_LEN.setdefault(len(w), []).append(w)
+    src = _BY_LEN.get(n - 1, []) + _BY_LEN.get(n, []) + _BY_LEN.get(n + 1, [])
+    if not src:
+        return []
+    out = set()
+    for _ in range(count * 5):
+        w = random.choice(src)
+        i = random.randrange(len(w))
+        op = random.choice(("sub", "drop", "add"))
+        if op == "sub":
+            u = w[:i] + random.choice(_V if w[i] in "aeiouy" else _C) + w[i + 1:]
+        elif op == "drop":
+            u = w[:i] + w[i + 1:]
+        else:
+            u = w[:i] + random.choice(_V + _C) + w[i:]
+        if len(u) == n and u not in scoring.WORDS and u not in scoring.BRANDS and scoring.is_valid(u) and _pretty(u):
+            out.add(u)
+            if len(out) >= count:
+                break
+    return list(out)
+
 SCANNERS: list["Scanner"] = []
 
 
@@ -74,12 +118,17 @@ class Scanner:
                 return "unknown"
 
     def _candidate(self):
-        for _ in range(8):
+        # слова и бренды целиком — самые ценные; «почти-слова» (слово с одной изменённой буквой) — запасной
+        # бесконечный источник: выглядят как настоящие слова, а не случайная каша
+        for _ in range(10):
             n = random.choice(LENGTHS)
-            mode = random.choices(("pron", "word", "brand"), weights=(1, 7, 2))[0]  # в основном настоящие слова и бренды
-            cs = [u for u in scoring.candidates(n, mode, 30) if u not in seen and scoring.score(u)[0] >= MIN_SCORE]
-            if not cs and mode != "pron":  # слова нужной длины кончились — звучные
-                cs = [u for u in scoring.candidates(n, "pron", 30) if u not in seen and scoring.score(u)[0] >= MIN_SCORE]
+            mode = random.choices(("word", "brand", "near"), weights=(5, 2, 3))[0]
+            if mode == "near":
+                cs = [u for u in _near_words(n) if u not in seen and scoring.score(u)[0] >= NEAR_MIN]
+            else:
+                cs = [u for u in scoring.candidates(n, mode, 30) if u not in seen and scoring.score(u)[0] >= MIN_SCORE]
+                if not cs:  # слова нужной длины кончились — берём «почти-слова»
+                    cs = [u for u in _near_words(n) if u not in seen and scoring.score(u)[0] >= NEAR_MIN]
             if cs:
                 top = max(scoring.score(x)[0] for x in cs)
                 u = random.choice([x for x in cs if scoring.score(x)[0] == top])
