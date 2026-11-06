@@ -20,6 +20,23 @@ POOL_LENGTHS = sorted(set(LENGTHS))
 MIN_SCORE = int(os.getenv("POOL_MIN_SCORE", 54))  # слабее этого сканеры даже не проверяют (54 = только слова и бренды)
 seen: dict[str, float] = {}  # общий для всех сканеров список уже проверенных
 
+# Оповещения: находка этой длины и от этой оценки сразу уходит владельцу (в Render можно поменять ALERT_LENGTHS / ALERT_MIN_SCORE)
+ALERT_MIN = int(os.getenv("ALERT_MIN_SCORE", 50))
+ALERT_LENGTHS = {int(x) for x in os.getenv("ALERT_LENGTHS", "5,6").split(",") if x.strip().isdigit()}
+_alert = None  # функция оповещения, её передаёт bot.py
+_alert_tasks: set = set()
+
+
+def set_alert(fn):
+    global _alert
+    _alert = fn
+
+
+def alert_line() -> str:
+    if not _alert:
+        return "🚨 Оповещения: выключены (не задан OWNER_ID)"
+    return f"🚨 Оповещения: {', '.join(map(str, sorted(ALERT_LENGTHS)))} симв., от {ALERT_MIN} баллов"
+
 NEAR_MIN = int(os.getenv("NEAR_MIN_SCORE", 35))  # минимальная оценка «почти-слов»
 _V, _C = "aeiou", "bdfgklmnprstv"
 _BY_LEN: dict[int, list[str]] = {}
@@ -189,10 +206,18 @@ class Scanner:
                 self.day_count += 1
                 if ok:
                     self.found += 1
-                    await db.run(
-                        "INSERT INTO pool(username,length,score,found) VALUES(?,?,?,?) "
-                        "ON CONFLICT(username) DO UPDATE SET found=excluded.found",
-                        (u, len(u), scoring.score(u)[0], int(time.time())))
+                    sc = scoring.score(u)[0]
+                    if _alert and len(u) in ALERT_LENGTHS and sc >= ALERT_MIN:
+                        # ценная находка: сразу шлём владельцу и НЕ кладём на склад,
+                        # чтобы её не выдали случайному пользователю при обычном поиске
+                        t = asyncio.create_task(_alert(u, sc, self.name))
+                        _alert_tasks.add(t)
+                        t.add_done_callback(_alert_tasks.discard)
+                    else:
+                        await db.run(
+                            "INSERT INTO pool(username,length,score,found) VALUES(?,?,?,?) "
+                            "ON CONFLICT(username) DO UPDATE SET found=excluded.found",
+                            (u, len(u), sc, int(time.time())))
                 await asyncio.sleep(random.uniform(0.85 * DELAY, 1.15 * DELAY))
             except (errors.UsernameInvalidError, errors.UsernameOccupiedError):
                 self.checked += 1
