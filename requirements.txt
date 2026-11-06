@@ -1,0 +1,4 @@
+aiogram>=3.13,<4
+telethon>=1.36
+aiosqlite>=0.20
+pillow>=10.1
