@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import time
 
 from aiogram import Bot, Dispatcher, F
@@ -125,7 +126,7 @@ async def add_trap(uid, u):
     n = (await db.run("SELECT COUNT(*) FROM traps WHERE user_id=?", (uid,), fetch=True))[0][0]
     if n >= MAX_TRAPS:
         return f"Лимит ловушек: {MAX_TRAPS}. Удали лишнюю: /untrap name"
-    st = await checker.check(u, fresh=True)
+    st = await smart_check(u, fresh=True)
     if st == "free":
         return f"✅ @{u} уже свободен — забирай!"
     if st == "invalid":
@@ -140,6 +141,50 @@ async def start(m: Message):
     await m.answer(HOME, reply_markup=home_kb())
 
 
+def all_checkers():
+    """Основной аккаунт + подключённые сканеры: любой из них может проверять ники."""
+    return [checker] + scanner.live_checkers()
+
+
+def any_ready() -> bool:
+    return any(c.ready() for c in all_checkers())
+
+
+def cooling_left() -> int:
+    """0 — хотя бы один аккаунт может работать; иначе сколько секунд до ближайшего."""
+    cs = all_checkers()
+    if any(c.ready() for c in cs):
+        return 0
+    return min((c.cooling() for c in cs if c.cooling()), default=0)
+
+
+def acc_lines():
+    out = []
+    for c in all_checkers():
+        left = c.cooling()
+        out.append(f"• {c.name}: " + (f"отдыхает ещё ~{left // 60 + 1} мин 🧊" if left else "готов ✅"))
+    return out
+
+
+async def smart_check(u: str, fresh: bool = False) -> str:
+    """Проверка ника любым свободным аккаунтом (по кругу, самым отдохнувшим). Уснул один — берём другой."""
+    if not fresh and checker.is_taken(u):
+        return "taken"
+    tried = set()
+    while True:
+        c = min((x for x in all_checkers() if x.ready() and id(x) not in tried),
+                key=lambda x: x.last_used, default=None)
+        if c is None:
+            return "flood"
+        tried.add(id(c))
+        st = await c.check(u, True)
+        if st == "flood":
+            continue  # этот аккаунт отдыхает — пробуем следующий
+        if st == "taken":
+            checker._mark_taken(u)
+        return st
+
+
 async def take_from_pool(lengths):
     """Берёт лучший ник из пула, перепроверяет одним запросом. Не больше 3 проверок основного аккаунта."""
     ph = ",".join("?" * len(lengths))
@@ -147,7 +192,7 @@ async def take_from_pool(lengths):
                         tuple(lengths), fetch=True)
     for u, sc in rows:
         await db.run("DELETE FROM pool WHERE username=?", (u,))  # забираем, чтобы не отдать двоим
-        st = await checker.check(u, fresh=True)
+        st = await smart_check(u, fresh=True)
         if st == "free":
             return sc, u, st
         if st == "flood":
@@ -195,7 +240,7 @@ async def run_find(target: Message, user, length, mode):
     label = f"{lengths[0]}–{lengths[-1]}" if len(lengths) > 1 else str(lengths[0])
     if uid in busy:
         return await target.answer("⏳ Предыдущий поиск ещё печётся, подожди немного 🥐")
-    if (left := checker.cooling()):
+    if (left := cooling_left()):
         return await target.answer(f"🧊 Печь остывает: Telegram просил притормозить. Вернусь через ~{left // 60 + 1} мин, "
                                    "так аккаунт останется целым.")
     wait = FIND_GAP - (time.time() - last_find.get(uid, 0))
@@ -220,7 +265,7 @@ async def run_find(target: Message, user, length, mode):
         msg = await target.answer(f"{BAKING[0]}…")
         hit, fallback, checked = None, None, 0
         for u in cands:
-            st = await checker.check(u)
+            st = await smart_check(u)
             checked += 1
             if st == "flood":
                 break
@@ -236,10 +281,10 @@ async def run_find(target: Message, user, length, mode):
                     pass
         await msg.delete()
         best = hit or fallback
-        if not best and checker.cooling():
+        if not best and (left := cooling_left()):
             return await target.answer("🧊 Telegram просит притормозить, я ставлю поиск на паузу, чтобы не рисковать аккаунтом. "
-                                       f"Загляни через ~{checker.cooling() // 60 + 1} мин.")
-        if not best and checked and checker.day_count > checker.day_limit:
+                                       f"Загляни через ~{left // 60 + 1} мин.")
+        if not best and checked and not any_ready():
             return await target.answer("🧊 Дневной лимит проверок исчерпан, продолжим завтра. Так аккаунт в безопасности.")
         if not best:
             return await target.answer(f"🥲 Проверил {checked}, и всё занято. Булки закончились, жми «Ещё свежий»!",
@@ -291,7 +336,7 @@ async def do_rate(target: Message, user, raw: str):
         return await target.answer("⚠️ Ник: 4–32 символа, a–z, 0–9, _, начинается с буквы, без «__» и «_» в конце.")
     await db.touch(user.id, user.full_name, searched=True)
     sc, parts = scoring.score(u)
-    st = await checker.check(u, fresh=True)
+    st = await smart_check(u, fresh=True)
     detail = "\n".join(f"{'+' if p >= 0 else '−'}{abs(p)} {label}" for label, p in parts if p)
     cap = f"<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n{STATUS[st]}\n\n{detail}"
     await send_card(target, u, sc, st, cap, nick_kb(u, user.id))
@@ -383,7 +428,26 @@ async def pool_cmd(m: Message):
     rows = await db.run("SELECT length, COUNT(*) FROM pool GROUP BY length ORDER BY length", fetch=True)
     stock = ", ".join(f"{n} симв.: {c}" for n, c in rows) or "пусто"
     await m.answer(f"📦 <b>Склад свободных ников</b>\n{stock}\n\n🤖 <b>Сканеры</b>\n" + "\n".join(scanner.status_lines()) +
-                   f"\n\n🗄 База: {db.BACKEND}")
+                   "\n\n🔑 <b>Аккаунты для поиска</b>\n" + "\n".join(acc_lines()) + f"\n\n🗄 База: {db.BACKEND}")
+
+
+@dp.message(Command("clearpool"))
+async def clearpool_cmd(m: Message):
+    if m.from_user.id != OWNER_ID:
+        return await m.answer("Команда только для владельца бота.")
+    await db.run("DELETE FROM pool")
+    await m.answer("🧹 Склад очищен, сканеры наполнят его заново.")
+
+
+@dp.message(Command("rest"))
+async def rest_cmd(m: Message, command: CommandObject):
+    if m.from_user.id != OWNER_ID:
+        return await m.answer("Команда только для владельца бота.")
+    arg = (command.args or "").split()
+    if not arg or not arg[0].isdigit():
+        return await m.answer("Использование: <code>/rest 540</code> — основной аккаунт отдыхает 540 минут (0 — разбудить).")
+    await checker.rest(int(arg[0]))
+    await m.answer(f"🧊 Основной аккаунт отдыхает {arg[0]} мин. Остальные продолжают работать." if int(arg[0]) else "☀️ Основной аккаунт снова в строю.")
 
 
 @dp.message(Command("untrap"))
@@ -441,7 +505,7 @@ async def trap_loop():
         await asyncio.sleep(TRAP_INTERVAL)
         try:
             for (u,) in await db.run("SELECT DISTINCT username FROM traps", fetch=True):
-                st = await checker.check(u, fresh=True)
+                st = await smart_check(u, fresh=True)
                 if st not in ("free", "fragment"):
                     continue
                 for uid, old in await db.run("SELECT user_id, state FROM traps WHERE username=?", (u,), fetch=True):
