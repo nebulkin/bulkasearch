@@ -21,6 +21,9 @@ SCHEMA = [
     "CREATE INDEX IF NOT EXISTS pool_len ON pool(length, score)",
     # паузы аккаунтов после FloodWait — переживают перезапуск сервиса
     "CREATE TABLE IF NOT EXISTS cooldowns(name TEXT PRIMARY KEY, until BIGINT)",
+    # ники, которые сканеры уже проверяли: после перезапуска не начинаем проход заново
+    "CREATE TABLE IF NOT EXISTS checked(username TEXT PRIMARY KEY, ts BIGINT)",
+    "CREATE INDEX IF NOT EXISTS checked_ts ON checked(ts)",
 ]
 
 
@@ -103,3 +106,22 @@ async def set_cooldown(name: str, until: float):
                   (name, int(until)))
     except Exception:
         logging.exception("set_cooldown")
+
+
+async def load_checked(ttl: int) -> dict:
+    """Ники, проверенные сканерами за последние ttl секунд. Старые записи заодно удаляются."""
+    try:
+        await run("DELETE FROM checked WHERE ts < ?", (int(time.time()) - ttl,))
+        rows = await run("SELECT username, ts FROM checked", fetch=True)
+        return {u: float(t) for u, t in rows}
+    except Exception:
+        logging.exception("load_checked")
+        return {}
+
+
+async def mark_checked(u: str):
+    try:
+        await run("INSERT INTO checked(username,ts) VALUES(?,?) ON CONFLICT(username) DO UPDATE SET ts=excluded.ts",
+                  (u, int(time.time())))
+    except Exception:
+        logging.exception("mark_checked")
