@@ -16,7 +16,7 @@ DELAY = float(os.getenv("SCAN_DELAY", 60))  # средняя пауза межд
 DAILY = int(os.getenv("SCAN_DAILY", 1500))  # максимум проверок на сканер в сутки
 POOL_MAX = int(os.getenv("POOL_MAX", 300))  # столько свободных ников держим «на складе»
 POOL_LENGTHS = sorted(set(LENGTHS))
-MIN_SCORE = int(os.getenv("POOL_MIN_SCORE", 35))  # слабее этого сканеры даже не проверяют
+MIN_SCORE = int(os.getenv("POOL_MIN_SCORE", 54))  # слабее этого сканеры даже не проверяют (54 = только слова и бренды)
 seen: dict[str, float] = {}  # общий для всех сканеров список уже проверенных
 SCANNERS: list["Scanner"] = []
 
@@ -76,7 +76,7 @@ class Scanner:
     def _candidate(self):
         for _ in range(8):
             n = random.choice(LENGTHS)
-            mode = random.choices(("pron", "word", "brand"), weights=(5, 3, 2))[0]  # слова и бренды — самые ценные находки
+            mode = random.choices(("pron", "word", "brand"), weights=(1, 7, 2))[0]  # в основном настоящие слова и бренды
             cs = [u for u in scoring.candidates(n, mode, 30) if u not in seen and scoring.score(u)[0] >= MIN_SCORE]
             if not cs and mode != "pron":  # слова нужной длины кончились — звучные
                 cs = [u for u in scoring.candidates(n, "pron", 30) if u not in seen and scoring.score(u)[0] >= MIN_SCORE]
