@@ -25,6 +25,8 @@ OWNER_ID = int(os.getenv("OWNER_ID", 0))  # твой Telegram ID: только �
 MAX_TRAPS = int(os.getenv("MAX_TRAPS", 10))
 TRAP_INTERVAL = int(os.getenv("TRAP_INTERVAL", 600))  # сек между проверками ловушек
 busy: set[int] = set()
+last_find: dict[int, float] = {}
+FIND_GAP = int(os.getenv("FIND_GAP", 20))  # сек между поисками одного человека
 
 BOT_DESCRIPTION = (
     "🥐 BulkaSearch — охотник за красивыми Telegram-юзернеймами.\n\n🔎 Находит свободные ники нужной длины: звучные, бренды, слова, паттерны\n📊 Оценивает любой ник и рисует карточку с ценой в TON\n🪤 Ловушка: напишу, как только ник освободится\n⭐ Избранное и личный кабинет\n\nНажми Start и пришли ник — я его оценю!"
@@ -140,7 +142,14 @@ async def run_find(target: Message, user, length, mode):
     uid = user.id
     if uid in busy:
         return await target.answer("⏳ Предыдущий поиск ещё печётся, подожди немного 🥐")
-    cands = scoring.candidates(length, mode, 120)
+    if (left := checker.cooling()):
+        return await target.answer(f"🧊 Печь остывает: Telegram просил притормозить. Вернусь через ~{left // 60 + 1} мин, "
+                                   "так аккаунт останется целым.")
+    wait = FIND_GAP - (time.time() - last_find.get(uid, 0))
+    if wait > 0:
+        return await target.answer(f"🥐 Булки ещё не остыли, подожди {int(wait) + 1} сек.")
+    last_find[uid] = time.time()
+    cands = scoring.candidates(length, mode, 60)
     if not cands:
         return await target.answer("🤷 Для такой длины и стиля нет вариантов. Попробуй другую длину.", reply_markup=len_kb(mode))
     # лучшие по оценке проверяем первыми — первый же свободный сразу отдаём
@@ -153,6 +162,8 @@ async def run_find(target: Message, user, length, mode):
         for u in cands:
             st = await checker.check(u)
             checked += 1
+            if st == "flood":
+                break
             if st == "free":
                 hit = (scoring.score(u)[0], u, st)
                 break
@@ -165,6 +176,11 @@ async def run_find(target: Message, user, length, mode):
                     pass
         await msg.delete()
         best = hit or fallback
+        if not best and checker.cooling():
+            return await target.answer("🧊 Telegram просит притормозить, я ставлю поиск на паузу, чтобы не рисковать аккаунтом. "
+                                       f"Загляни через ~{checker.cooling() // 60 + 1} мин.")
+        if not best and checked and checker.day_count > checker.day_limit:
+            return await target.answer("🧊 Дневной лимит проверок исчерпан, продолжим завтра. Так аккаунт в безопасности.")
         if not best:
             return await target.answer(f"🥲 Проверил {checked}, и всё занято. Булки закончились, жми «Ещё свежий»!",
                                        reply_markup=results_kb([], mode, length))
