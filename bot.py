@@ -26,35 +26,45 @@ MAX_TRAPS = int(os.getenv("MAX_TRAPS", 10))
 TRAP_INTERVAL = int(os.getenv("TRAP_INTERVAL", 600))  # сек между проверками ловушек
 busy: set[int] = set()
 
+BOT_DESCRIPTION = (
+    "🥐 BulkaSearch — охотник за красивыми Telegram-юзернеймами.\n\n🔎 Находит свободные ники нужной длины: звучные, бренды, слова, паттерны\n📊 Оценивает любой ник и рисует карточку с ценой в TON\n🪤 Ловушка: напишу, как только ник освободится\n⭐ Избранное и личный кабинет\n\nНажми Start и пришли ник — я его оценю!"
+)
+BOT_SHORT = "🥐 Ищу свободные красивые юзернеймы, оцениваю в TON и ловлю освободившиеся. Свежие ники — горячими!"
+
 HOME = (
-    "<b>✨ Охотник за юзернеймами</b>\n\n"
-    "Ищу красивые свободные ники, оцениваю их и рисую карточку.\n"
-    "Можно просто прислать ник сообщением — я его оценю."
+    "🥐 <b>BulkaSearch</b>\n"
+    "<i>Свежие юзернеймы — горячими, пока не остыли</i>\n\n"
+    "🔎 Найду свободный ник за пару секунд\n"
+    "📊 Оценю любой ник и нарисую красивую карточку\n"
+    "🪤 Поставлю ловушку и скажу, когда ник освободится\n\n"
+    "Просто пришли ник, например <code>bulka</code> 👇"
 )
 HELP = (
-    "<b>Команды</b>\n"
-    "/find — поиск кнопками (или <code>/find 5 brand</code>)\n"
-    "/rate name — оценка ника (или просто пришли ник)\n"
-    "/trap name — ловушка: сообщу, когда ник освободится\n"
-    "/cabinet — кабинет, избранное, ловушки\n"
-    "/set name — поставить ник на аккаунт (userbot, только владелец)\n"
-    "/unfav name · /untrap name — удалить\n\n"
-    "Ники до 4 символов обычно только на Fragment."
+    "🥐 <b>BulkaSearch · команды</b>\n\n"
+    "🔎 /find — поиск кнопками (или <code>/find 6 pron</code>)\n"
+    "📊 /rate <i>name</i> — оценка ника (или просто пришли ник)\n"
+    "🪤 /trap <i>name</i> — ловушка: сообщу, когда ник освободится\n"
+    "👤 /cabinet — кабинет, избранное, ловушки\n"
+    "✏️ /set <i>name</i> — поставить ник на аккаунт (только владелец)\n"
+    "🗑 /unfav <i>name</i> · /untrap <i>name</i> — удалить\n\n"
+    "💡 Ники до 4 символов обычно продаются только на Fragment."
 )
-MODE_NAMES = {"pron": "🗣 Читаемые", "brand": "🏷 Бренды", "word": "📖 Слова", "pattern": "🔁 Паттерны"}
+MODE_NAMES = {"pron": "🗣 Звучные", "brand": "🏷 Бренды", "word": "📖 Словарные", "pattern": "🔁 Паттерны"}
+BAKING = ("🥐 Достаю свежие ники из печи", "🔥 Греем юзернеймы", "🍞 Замешиваю варианты", "✨ Посыпаем сахарной пудрой")
 
 
 def btn(text, data):
     return InlineKeyboardButton(text=text, callback_data=data)
 
 
-HOME_BTN = [btn("🏠 Меню", "m:home")]
+HOME_BTN = [btn("🥐 В меню", "m:home")]
 
 
 def home_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("🔎 Найти ник", "m:find"), btn("📊 Оценить ник", "m:rate")],
-        [btn("👤 Кабинет", "m:cab"), btn("ℹ️ Помощь", "m:help")],
+        [btn("🔎 Найти свободный", "m:find")],
+        [btn("📊 Оценить ник", "m:rate"), btn("⭐ Мой кабинет", "m:cab")],
+        [btn("❓ Помощь", "m:help")],
     ])
 
 
@@ -72,7 +82,7 @@ def len_kb(mode):
 
 def results_kb(found, mode, length):
     rows = [[btn(f"{'✅' if st == 'free' else '💎'} @{u} · {sc}", f"r:{u}")] for sc, u, st in found[:6]]
-    rows.append([btn("🔄 Ещё", f"f:{mode}:{length}")] + HOME_BTN)
+    rows.append([btn("🔄 Ещё свежий", f"f:{mode}:{length}")] + HOME_BTN)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -129,16 +139,16 @@ async def start(m: Message):
 async def run_find(target: Message, user, length, mode):
     uid = user.id
     if uid in busy:
-        return await target.answer("Предыдущий поиск ещё идёт, подожди немного.")
+        return await target.answer("⏳ Предыдущий поиск ещё печётся, подожди немного 🥐")
     cands = scoring.candidates(length, mode, 120)
     if not cands:
-        return await target.answer("Для такой длины и режима нет кандидатов — попробуй другую.", reply_markup=len_kb(mode))
+        return await target.answer("🤷 Для такой длины и стиля нет вариантов. Попробуй другую длину.", reply_markup=len_kb(mode))
     # лучшие по оценке проверяем первыми — первый же свободный сразу отдаём
     cands.sort(key=lambda x: scoring.score(x)[0], reverse=True)
     busy.add(uid)
     try:
         await db.touch(uid, user.full_name, searched=True)
-        msg = await target.answer("🔎 Ищу свободный ник…")
+        msg = await target.answer(f"{BAKING[0]}…")
         hit, fallback, checked = None, None, 0
         for u in cands:
             st = await checker.check(u)
@@ -148,15 +158,22 @@ async def run_find(target: Message, user, length, mode):
                 break
             if st == "fragment" and fallback is None:
                 fallback = (scoring.score(u)[0], u, st)
+            if checked % 8 == 0:  # живой прогресс, но не чаще — лимиты Telegram
+                try:
+                    await msg.edit_text(f"{BAKING[(checked // 8) % len(BAKING)]}… <i>проверено {checked}</i>")
+                except Exception:
+                    pass
         await msg.delete()
         best = hit or fallback
         if not best:
-            return await target.answer(f"Проверил {checked} — все заняты 😕 Нажми «Ещё».", reply_markup=results_kb([], mode, length))
+            return await target.answer(f"🥲 Проверил {checked}, и всё занято. Булки закончились, жми «Ещё свежий»!",
+                                       reply_markup=results_kb([], mode, length))
         sc, u, st = best
-        cap = (f"<b>{'Свободен' if st == 'free' else 'На Fragment'}: @{u}</b> — {sc}/100 {scoring.tier(sc)}\n"
-               f"Проверено: {checked} · {MODE_NAMES[mode]} · {length} симв.")
+        head = "🎉 <b>Свободный ник найден!</b>" if st == "free" else "💎 <b>Нашёл на Fragment</b>"
+        cap = (f"{head}\n\n<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n"
+               f"{MODE_NAMES[mode]} · {length} симв. · проверено {checked}")
         await send_card(target, u, sc, st, cap, nick_kb(u, user.id))
-        await target.answer("Ещё один?", reply_markup=results_kb([], mode, length))
+        await target.answer("Ещё один? 👇", reply_markup=results_kb([], mode, length))
     finally:
         busy.discard(uid)
 
@@ -165,7 +182,7 @@ async def run_find(target: Message, user, length, mode):
 async def find(m: Message, command: CommandObject):
     args = (command.args or "").lower().split()
     if not args:
-        return await m.answer("Что ищем? Выбери режим:", reply_markup=mode_kb())
+        return await m.answer("🔎 <b>Что ищем?</b>\nВыбери стиль ника 👇", reply_markup=mode_kb())
     length = next((int(a) for a in args if a.isdigit()), 5)
     mode = next((a for a in args if a in scoring.MODES), "pron")
     if not 4 <= length <= 12:
@@ -183,18 +200,18 @@ async def cb_find(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("fm:"))
 async def cb_mode(c: CallbackQuery):
     mode = c.data[3:]
-    await show(c, f"{MODE_NAMES[mode]}\nКакой длины ник нужен?", len_kb(mode))
+    await show(c, f"{MODE_NAMES[mode]}\n\n📏 <b>Какой длины ник?</b>\nЧем короче, тем круче (и дороже) 💎", len_kb(mode))
 
 
 async def do_rate(target: Message, user, raw: str):
     u = scoring.normalize(raw)
     if not scoring.is_valid(u):
-        return await target.answer("Ник: 4–32 символа, a–z, 0–9, _, начинается с буквы, без «__» и «_» в конце.")
+        return await target.answer("⚠️ Ник: 4–32 символа, a–z, 0–9, _, начинается с буквы, без «__» и «_» в конце.")
     await db.touch(user.id, user.full_name, searched=True)
     sc, parts = scoring.score(u)
     st = await checker.check(u)
     detail = "\n".join(f"{'+' if p >= 0 else '−'}{abs(p)} {label}" for label, p in parts if p)
-    cap = f"<b>@{u}</b> — {sc}/100 {scoring.tier(sc)}\n{STATUS[st]}\n\n{detail}"
+    cap = f"<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n{STATUS[st]}\n\n{detail}"
     await send_card(target, u, sc, st, cap, nick_kb(u, user.id))
 
 
@@ -210,9 +227,9 @@ async def cb_menu(c: CallbackQuery):
     if act == "home":
         await show(c, HOME, home_kb())
     elif act == "find":
-        await show(c, "Что ищем? Выбери режим:", mode_kb())
+        await show(c, "🔎 <b>Что ищем?</b>\nВыбери стиль ника 👇", mode_kb())
     elif act == "rate":
-        await show(c, "Пришли ник сообщением, например <code>example</code> — оценю и нарисую карточку.",
+        await show(c, "📊 <b>Оценка ника</b>\nПришли ник сообщением, например <code>bulka</code>, и я нарисую карточку с оценкой и ценой в TON ✨",
                    InlineKeyboardMarkup(inline_keyboard=[HOME_BTN]))
     elif act == "help":
         await show(c, HELP, InlineKeyboardMarkup(inline_keyboard=[HOME_BTN]))
@@ -281,14 +298,14 @@ async def cb_setok(c: CallbackQuery):
 async def untrap(m: Message, command: CommandObject):
     u = scoring.normalize(command.args or "")
     await db.run("DELETE FROM traps WHERE user_id=? AND username=?", (m.from_user.id, u))
-    await m.answer(f"Ловушка на @{u} снята.")
+    await m.answer(f"🪤 Ловушка на @{u} снята.")
 
 
 @dp.message(Command("unfav"))
 async def unfav(m: Message, command: CommandObject):
     u = scoring.normalize(command.args or "")
     await db.run("DELETE FROM favs WHERE user_id=? AND username=?", (m.from_user.id, u))
-    await m.answer(f"@{u} убран из избранного.")
+    await m.answer(f"🗑 @{u} убран из избранного.")
 
 
 async def cab_view(user):
@@ -338,9 +355,9 @@ async def trap_loop():
                 for uid, old in await db.run("SELECT user_id, state FROM traps WHERE username=?", (u,), fetch=True):
                     if old == st:
                         continue
-                    where = "свободен — успей занять!" if st == "free" else "появился на Fragment"
+                    where = "свободен, беги занимать! 🏃" if st == "free" else "появился на Fragment"
                     try:
-                        await bot.send_message(uid, f"🪤 <b>@{u}</b> {where}")
+                        await bot.send_message(uid, f"🪤🎉 <b>@{u}</b> {where}")
                     except Exception:
                         logging.exception("notify failed")
                     if st == "free":
@@ -366,11 +383,16 @@ async def start_web():
 async def main():
     await db.init()
     await bot.set_my_commands([
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="find", description="Найти красивый ник"),
-        BotCommand(command="cabinet", description="Кабинет"),
-        BotCommand(command="help", description="Помощь"),
+        BotCommand(command="start", description="🥐 Главное меню"),
+        BotCommand(command="find", description="🔎 Найти свободный ник"),
+        BotCommand(command="cabinet", description="⭐ Мой кабинет"),
+        BotCommand(command="help", description="❓ Помощь"),
     ])
+    try:  # описание, которое видно в пустом чате, и «О боте» в профиле
+        await bot.set_my_description(BOT_DESCRIPTION)
+        await bot.set_my_short_description(BOT_SHORT)
+    except Exception:
+        logging.exception("set description")
     await checker.start()
     await start_web()
     asyncio.create_task(trap_loop())
