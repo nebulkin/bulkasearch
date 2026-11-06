@@ -427,7 +427,7 @@ async def pool_cmd(m: Message):
         return await m.answer("Команда только для владельца бота.")
     rows = await db.run("SELECT length, COUNT(*) FROM pool GROUP BY length ORDER BY length", fetch=True)
     stock = ", ".join(f"{n} симв.: {c}" for n, c in rows) or "пусто"
-    await m.answer(f"📦 <b>Склад свободных ников</b>\n{stock}\n\n🤖 <b>Сканеры</b>\n" + "\n".join(scanner.status_lines()) + "\n" + scanner.alert_line() +
+    await m.answer(f"📦 <b>Склад свободных ников</b>\n{stock}\n\n🤖 <b>Сканеры</b>\n" + "\n".join(scanner.status_lines()) + "\n" + scanner.alert_line() + "\n" + scanner.seen_line() +
                    "\n\n🔑 <b>Аккаунты для поиска</b>\n" + "\n".join(acc_lines()) + f"\n\n🗄 База: {db.BACKEND}")
 
 
