@@ -19,6 +19,8 @@ SCHEMA = [
     # пул свободных ников, который наполняют фоновые сканеры
     "CREATE TABLE IF NOT EXISTS pool(username TEXT PRIMARY KEY, length INTEGER, score INTEGER, found BIGINT)",
     "CREATE INDEX IF NOT EXISTS pool_len ON pool(length, score)",
+    # паузы аккаунтов после FloodWait — переживают перезапуск сервиса
+    "CREATE TABLE IF NOT EXISTS cooldowns(name TEXT PRIMARY KEY, until BIGINT)",
 ]
 
 
@@ -84,3 +86,20 @@ async def touch(uid, name, searched=False):
               (uid, name, int(time.time())))
     if searched:
         await run("UPDATE users SET searches=searches+1 WHERE id=?", (uid,))
+
+
+async def get_cooldown(name: str) -> float:
+    try:
+        rows = await run("SELECT until FROM cooldowns WHERE name=?", (name,), fetch=True)
+        return float(rows[0][0]) if rows else 0.0
+    except Exception:
+        logging.exception("get_cooldown")
+        return 0.0
+
+
+async def set_cooldown(name: str, until: float):
+    try:
+        await run("INSERT INTO cooldowns(name,until) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET until=excluded.until",
+                  (name, int(until)))
+    except Exception:
+        logging.exception("set_cooldown")
