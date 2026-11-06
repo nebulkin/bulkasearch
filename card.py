@@ -74,7 +74,7 @@ def render_card(u: str, sc: int, st: str, lo: int, hi: int) -> bytes:
     sd = ImageDraw.Draw(sh)
     sd.text((W // 2 + 4, 592 // 2 - 6 + 5), text, font=f, fill=(0, 0, 0, 70), anchor="mm")
     sd.rounded_rectangle((70, 400, W - 70, 418), radius=9, fill=(255, 255, 255, 50))
-    sd.text((W // 2, 506), "оценка — эвристика, не котировка", font=_font(20), fill=(255, 255, 255, 120), anchor="mm")
+    sd.text((W // 2, 506), "BULKASEARCH  ·  оценка — эвристика, не котировка", font=_font(20), fill=(255, 255, 255, 120), anchor="mm")
     img = Image.alpha_composite(img, sh)
     d = ImageDraw.Draw(img)
     d.text((W // 2, 592 // 2 - 6), text, font=f, fill=(255, 255, 255), anchor="mm")
