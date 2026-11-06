@@ -92,15 +92,18 @@ class Scanner:
     async def run(self, start_delay: float = 0):
         await asyncio.sleep(start_delay)
         try:
+            self.state = "подключается…"
             client = TelegramClient(StringSession(self.session), int(os.environ["API_ID"]), os.environ["API_HASH"])
-            await client.connect()
-            if not await client.is_user_authorized():
+            await asyncio.wait_for(client.connect(), 90)
+            if not await asyncio.wait_for(client.is_user_authorized(), 90):
                 self.state = "сессия недействительна ❌"
                 return logging.error("scanner %s: сессия недействительна", self.name)
             self.client = client
             self.cooldown_until = await db.get_cooldown(self.key)
-        except Exception:
-            self.state = "не запустился ❌"
+            self.state = "подключён, подбирает ники…"
+            logging.info("scanner %s: подключён", self.name)
+        except Exception as e:
+            self.state = f"не запустился ❌ ({type(e).__name__})"
             return logging.exception("scanner %s не запустился", self.name)
         last_clean = 0.0
         while True:
@@ -126,6 +129,7 @@ class Scanner:
                     continue
                 u = self._candidate()
                 if not u:
+                    self.state = "нет подходящих ников (проверь words.txt и POOL_MIN_SCORE)"
                     await asyncio.sleep(5)
                     continue
                 self.state = "ищет 🔎"
@@ -167,6 +171,8 @@ def start_all(main_session: str = ""):
         sc = Scanner(f"сканер {i}", sess, f"scan{i}")
         SCANNERS.append(sc)
         asyncio.create_task(sc.run(start_delay=(i - 1) * DELAY / 2))
+    logging.info("scanner: слов в словаре %d, брендов %d, мин. оценка %d, длины %s",
+                 len(scoring.WORDS), len(scoring.BRANDS), MIN_SCORE, LENGTHS)
     if not SCANNERS:
         logging.info("SCAN_SESSIONS пуст — фоновый поиск выключен")
 
