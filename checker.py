@@ -27,9 +27,18 @@ class Checker:
             StringSession(os.environ["TG_SESSION"]), int(os.environ["API_ID"]), os.environ["API_HASH"]
         )
         self.lock = asyncio.Lock()  # проверяем строго по одному, чтобы не ловить FloodWait
+        self.taken: dict[str, float] = {}  # недавно проверенные занятые — повторно не спрашиваем
         self.cooldown_until = 0.0  # после FloodWait молчим, а не долбим дальше
         self.day, self.day_count = time.strftime("%Y%m%d"), 0
         self.day_limit = int(os.getenv("MAX_CHECKS_PER_DAY", 800))
+
+    def is_taken(self, u: str) -> bool:
+        return time.time() - self.taken.get(u, 0) < 6 * 3600
+
+    def _mark_taken(self, u: str):
+        if len(self.taken) > 20000:
+            self.taken.clear()
+        self.taken[u] = time.time()
 
     def cooling(self) -> int:
         """Сколько секунд ещё отдыхаем (0 — можно работать)."""
@@ -73,17 +82,23 @@ class Checker:
                 msg = getattr(e, "message", "") or str(e)
                 return "fragment" if "PURCHASE_AVAILABLE" in msg else "fail"
 
-    async def check(self, u: str) -> str:
+    async def check(self, u: str, fresh: bool = False) -> str:
+        """fresh=True — всегда спросить Telegram; иначе занятые из кеша отдаём сразу (экономим лимиты)."""
+        if not fresh and self.is_taken(u):
+            return "taken"
         if self.cooling() or not self._budget():
             return "flood"
         async with self.lock:
             try:
                 ok = await self.client(functions.account.CheckUsernameRequest(username=u))
                 await asyncio.sleep(random.uniform(1.2, 2.2))  # неровный темп, как у человека
+                if not ok:
+                    self._mark_taken(u)
                 return "free" if ok else "taken"
             except errors.UsernameInvalidError:
                 return "invalid"
             except errors.UsernameOccupiedError:
+                self._mark_taken(u)
                 return "taken"
             except errors.FloodWaitError as e:
                 # не ждём и не повторяем: отдыхаем с запасом
