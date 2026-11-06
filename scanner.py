@@ -18,7 +18,41 @@ DAILY = int(os.getenv("SCAN_DAILY", 1500))  # максимум проверок 
 POOL_MAX = int(os.getenv("POOL_MAX", 300))  # столько свободных ников держим «на складе»
 POOL_LENGTHS = sorted(set(LENGTHS))
 MIN_SCORE = int(os.getenv("POOL_MIN_SCORE", 54))  # слабее этого сканеры даже не проверяют (54 = только слова и бренды)
-seen: dict[str, float] = {}  # общий для всех сканеров список уже проверенных
+seen: dict[str, float] = {}  # общий для всех сканеров список уже проверенных (ник -> когда проверили)
+SEEN_DAYS = int(os.getenv("SEEN_DAYS", 14))  # столько дней помним проверенное; потом проверим ещё раз (ники иногда освобождаются)
+SEEN_TTL = SEEN_DAYS * 86400
+SEEN_MAX = 200000  # предохранитель размера памяти
+_seen_lock = asyncio.Lock()
+_seen_loaded = False
+
+
+def _new(u: str) -> bool:
+    """Ник ещё не проверяли (или проверяли давно)."""
+    t = seen.get(u)
+    return t is None or time.time() - t > SEEN_TTL
+
+
+async def _load_seen():
+    """Один раз при старте подтягиваем из базы всё, что сканеры уже проверяли."""
+    global _seen_loaded
+    async with _seen_lock:
+        if _seen_loaded:
+            return
+        _seen_loaded = True
+        old = await db.load_checked(SEEN_TTL)
+        seen.update(old)
+        logging.info("scanner: из базы загружено уже проверенных ников: %d", len(old))
+
+
+def seen_line() -> str:
+    """Для /pool: сколько запомнено и какая доля словаря уже пройдена."""
+    now = time.time()
+    parts = []
+    for n in (5, 6, 7):
+        ws = [w for w in scoring.WORDS if len(w) == n]
+        done = sum(1 for w in ws if w in seen and now - seen[w] <= SEEN_TTL)
+        parts.append(f"{n} букв {done}/{len(ws)}")
+    return f"🧠 Запомнено проверенных ников: {len(seen)} (хранятся {SEEN_DAYS} дн.)\n📖 Словарь пройден: " + " · ".join(parts)
 
 # Оповещения: находка этой длины и от этой оценки сразу уходит владельцу (в Render можно поменять ALERT_LENGTHS / ALERT_MIN_SCORE)
 ALERT_MIN = int(os.getenv("ALERT_MIN_SCORE", 50))
@@ -141,15 +175,15 @@ class Scanner:
             n = random.choice(LENGTHS)
             mode = random.choices(("word", "brand", "near"), weights=(5, 2, 3))[0]
             if mode == "near":
-                cs = [u for u in _near_words(n) if u not in seen and scoring.score(u)[0] >= NEAR_MIN]
+                cs = [u for u in _near_words(n) if _new(u) and scoring.score(u)[0] >= NEAR_MIN]
             else:
-                cs = [u for u in scoring.candidates(n, mode, 30) if u not in seen and scoring.score(u)[0] >= MIN_SCORE]
+                cs = [u for u in scoring.candidates(n, mode, 30) if _new(u) and scoring.score(u)[0] >= MIN_SCORE]
                 if not cs:  # слова нужной длины кончились — берём «почти-слова»
-                    cs = [u for u in _near_words(n) if u not in seen and scoring.score(u)[0] >= NEAR_MIN]
+                    cs = [u for u in _near_words(n) if _new(u) and scoring.score(u)[0] >= NEAR_MIN]
             if cs:
                 top = max(scoring.score(x)[0] for x in cs)
                 u = random.choice([x for x in cs if scoring.score(x)[0] == top])
-                if len(seen) > 50000:
+                if len(seen) > SEEN_MAX:
                     seen.clear()
                 seen[u] = time.time()
                 return u
@@ -168,11 +202,13 @@ class Scanner:
             self.cooldown_until = await db.get_cooldown(self.key)
             self.state = "подключён, подбирает ники…"
             logging.info("scanner %s: подключён", self.name)
+            await _load_seen()
         except Exception as e:
             self.state = f"не запустился ❌ ({type(e).__name__})"
             return logging.exception("scanner %s не запустился", self.name)
         last_clean = 0.0
         while True:
+            u = None
             try:
                 left = self.cooling()
                 if left:
@@ -188,6 +224,7 @@ class Scanner:
                     continue
                 if time.time() - last_clean > 3600:  # старые находки могли уже уйти
                     await db.run("DELETE FROM pool WHERE found < ?", (int(time.time()) - 24 * 3600,))
+                    await db.run("DELETE FROM checked WHERE ts < ?", (int(time.time()) - SEEN_TTL,))
                     last_clean = time.time()
                 if (await db.run("SELECT COUNT(*) FROM pool", fetch=True))[0][0] >= POOL_MAX:
                     self.state = "склад полон 📦"
@@ -204,6 +241,7 @@ class Scanner:
                 self.last_used = time.time()
                 self.checked += 1
                 self.day_count += 1
+                await db.mark_checked(u)  # запоминаем в базе: «занято» или «свободно» — этот ник мы уже видели
                 if ok:
                     self.found += 1
                     sc = scoring.score(u)[0]
@@ -221,6 +259,8 @@ class Scanner:
                 await asyncio.sleep(random.uniform(0.85 * DELAY, 1.15 * DELAY))
             except (errors.UsernameInvalidError, errors.UsernameOccupiedError):
                 self.checked += 1
+                if u:
+                    await db.mark_checked(u)
                 await asyncio.sleep(random.uniform(0.85 * DELAY, 1.15 * DELAY))
             except errors.FloodWaitError as e:
                 logging.warning("scanner %s: FloodWait %s сек", self.name, e.seconds)
