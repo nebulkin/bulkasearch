@@ -1,24 +1,77 @@
+"""База: Postgres (Supabase) если задан DATABASE_URL, иначе SQLite-файл."""
+import logging
 import os
+import re
 import time
 
 import aiosqlite
 
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB = os.getenv("DB_PATH", "data.db")
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, joined INTEGER, searches INTEGER DEFAULT 0);
-CREATE TABLE IF NOT EXISTS favs(user_id INTEGER, username TEXT, score INTEGER, PRIMARY KEY(user_id, username));
-CREATE TABLE IF NOT EXISTS traps(user_id INTEGER, username TEXT, state TEXT, PRIMARY KEY(user_id, username));
-"""
+PG = bool(DATABASE_URL)
+BACKEND = "Supabase (Postgres)" if PG else "SQLite (файл)"
+_pool = None
+
+SCHEMA = [
+    "CREATE TABLE IF NOT EXISTS users(id BIGINT PRIMARY KEY, name TEXT, joined BIGINT, searches INTEGER DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS favs(user_id BIGINT, username TEXT, score INTEGER, PRIMARY KEY(user_id, username))",
+    "CREATE TABLE IF NOT EXISTS traps(user_id BIGINT, username TEXT, state TEXT, PRIMARY KEY(user_id, username))",
+    # пул свободных ников, который наполняют фоновые сканеры
+    "CREATE TABLE IF NOT EXISTS pool(username TEXT PRIMARY KEY, length INTEGER, score INTEGER, found BIGINT)",
+    "CREATE INDEX IF NOT EXISTS pool_len ON pool(length, score)",
+]
+
+
+def _pg(sql: str) -> str:
+    n = 0
+
+    def repl(_):
+        nonlocal n
+        n += 1
+        return f"${n}"
+
+    return re.sub(r"\?", repl, sql)
+
+
+async def _get_pool():
+    global _pool
+    if _pool is None:
+        import asyncpg
+
+        _pool = await asyncpg.create_pool(
+            DATABASE_URL, min_size=1, max_size=5, ssl="require",
+            statement_cache_size=0, command_timeout=30,  # statement_cache_size=0 — совместимость с пулерами Supabase
+        )
+    return _pool
 
 
 async def init():
+    global PG, BACKEND
+    if PG:
+        try:
+            pool = await _get_pool()
+            async with pool.acquire() as con:
+                for stmt in SCHEMA:
+                    await con.execute(stmt)
+            return
+        except Exception:
+            logging.exception("Supabase недоступен — перехожу на локальный SQLite (данные не будут сохраняться)")
+            PG, BACKEND = False, "SQLite (запасной: Supabase не подключился)"
     os.makedirs(os.path.dirname(DB) or ".", exist_ok=True)
     async with aiosqlite.connect(DB) as db:
-        await db.executescript(SCHEMA)
+        for stmt in SCHEMA:
+            await db.execute(stmt)
         await db.commit()
 
 
 async def run(sql, args=(), fetch=False):
+    if PG:
+        pool = await _get_pool()
+        async with pool.acquire() as con:
+            if fetch:
+                return [tuple(r) for r in await con.fetch(_pg(sql), *args)]
+            await con.execute(_pg(sql), *args)
+            return None
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(sql, args)
         rows = await cur.fetchall() if fetch else None
@@ -27,6 +80,7 @@ async def run(sql, args=(), fetch=False):
 
 
 async def touch(uid, name, searched=False):
-    await run("INSERT OR IGNORE INTO users(id,name,joined) VALUES(?,?,?)", (uid, name, int(time.time())))
+    await run("INSERT INTO users(id,name,joined) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING",
+              (uid, name, int(time.time())))
     if searched:
         await run("UPDATE users SET searches=searches+1 WHERE id=?", (uid,))
