@@ -14,6 +14,7 @@ from aiohttp import web
 
 import card
 import db
+import scanner
 import scoring
 from checker import STATUS, Checker
 
@@ -43,7 +44,8 @@ HOME = (
 )
 HELP = (
     "🥐 <b>BulkaSearch · команды</b>\n\n"
-    "🔎 /find — поиск кнопками (или <code>/find 6 pron</code>)\n"
+    "🔎 /find — поиск кнопками (или <code>/find 5-6 pron</code>)\n"
+    "⚡ /find quick — быстрый поиск свободного (6–7 символов)\n"
     "📊 /rate <i>name</i> — оценка ника (или просто пришли ник)\n"
     "🪤 /trap <i>name</i> — ловушка: сообщу, когда ник освободится\n"
     "👤 /cabinet — кабинет, избранное, ловушки\n"
@@ -64,7 +66,7 @@ HOME_BTN = [btn("🥐 В меню", "m:home")]
 
 def home_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("🔎 Найти свободный", "m:find")],
+        [btn("🔎 Найти свободный", "m:find"), btn("⚡ Быстрый поиск", "q:go")],
         [btn("📊 Оценить ник", "m:rate"), btn("⭐ Мой кабинет", "m:cab")],
         [btn("❓ Помощь", "m:help")],
     ])
@@ -73,18 +75,18 @@ def home_kb():
 def mode_kb():
     ms = list(MODE_NAMES.items())
     rows = [[btn(n, f"fm:{k}") for k, n in ms[i:i + 2]] for i in range(0, len(ms), 2)]
-    return InlineKeyboardMarkup(inline_keyboard=rows + [HOME_BTN])
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("⚡ Быстрый поиск", "q:go")]] + rows + [HOME_BTN])
 
 
 def len_kb(mode):
-    row1 = [btn(str(n), f"f:{mode}:{n}") for n in (4, 5, 6)]
-    row2 = [btn(str(n), f"f:{mode}:{n}") for n in (7, 8, 9)]
-    return InlineKeyboardMarkup(inline_keyboard=[row1, row2, [btn("⬅️ Режим", "m:find")] + HOME_BTN])
+    singles = [btn(str(n), f"f:{mode}:{n}") for n in (4, 5, 6, 7)]
+    ranges = [btn(f"{n}–{n + 1}", f"f:{mode}:{n}-{n + 1}") for n in (4, 5, 6, 7)]
+    return InlineKeyboardMarkup(inline_keyboard=[singles, ranges, [btn("⬅️ Стиль", "m:find")] + HOME_BTN])
 
 
 def results_kb(found, mode, length):
     rows = [[btn(f"{'✅' if st == 'free' else '💎'} @{u} · {sc}", f"r:{u}")] for sc, u, st in found[:6]]
-    rows.append([btn("🔄 Ещё свежий", f"f:{mode}:{length}")] + HOME_BTN)
+    rows.append([btn("🔄 Ещё свежий", "q:go" if length == "quick" else f"f:{mode}:{length}")] + HOME_BTN)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -113,7 +115,7 @@ async def send_card(target: Message, u, sc, st, caption, markup):
 
 async def add_fav(uid, u):
     sc = scoring.score(u)[0]
-    await db.run("INSERT OR REPLACE INTO favs VALUES(?,?,?)", (uid, u, sc))
+    await db.run("INSERT INTO favs(user_id,username,score) VALUES(?,?,?) ON CONFLICT(user_id,username) DO UPDATE SET score=excluded.score", (uid, u, sc))
     return f"⭐ @{u} в избранном"
 
 
@@ -123,12 +125,12 @@ async def add_trap(uid, u):
     n = (await db.run("SELECT COUNT(*) FROM traps WHERE user_id=?", (uid,), fetch=True))[0][0]
     if n >= MAX_TRAPS:
         return f"Лимит ловушек: {MAX_TRAPS}. Удали лишнюю: /untrap name"
-    st = await checker.check(u)
+    st = await checker.check(u, fresh=True)
     if st == "free":
         return f"✅ @{u} уже свободен — забирай!"
     if st == "invalid":
         return "⚠️ Недопустимый ник"
-    await db.run("INSERT OR REPLACE INTO traps VALUES(?,?,?)", (uid, u, st))
+    await db.run("INSERT INTO traps(user_id,username,state) VALUES(?,?,?) ON CONFLICT(user_id,username) DO UPDATE SET state=excluded.state", (uid, u, st))
     return f"🪤 Ловушка на @{u} поставлена (проверка каждые {TRAP_INTERVAL // 60} мин)"
 
 
@@ -138,8 +140,59 @@ async def start(m: Message):
     await m.answer(HOME, reply_markup=home_kb())
 
 
+async def take_from_pool(lengths):
+    """Берёт лучший ник из пула, перепроверяет одним запросом. Не больше 3 проверок основного аккаунта."""
+    ph = ",".join("?" * len(lengths))
+    rows = await db.run(f"SELECT username, score FROM pool WHERE length IN ({ph}) ORDER BY score DESC, found DESC LIMIT 3",
+                        tuple(lengths), fetch=True)
+    for u, sc in rows:
+        await db.run("DELETE FROM pool WHERE username=?", (u,))  # забираем, чтобы не отдать двоим
+        st = await checker.check(u, fresh=True)
+        if st == "free":
+            return sc, u, st
+        if st == "flood":
+            break
+    return None
+
+
+def parse_len(spec) -> list[int] | None:
+    """5 -> [5]; '5-6' -> [5, 6]; 'quick' -> [7, 6] (длиннее — свободнее)."""
+    if spec == "quick":
+        return [7, 6]
+    m = re.fullmatch(r"(\d+)(?:[-–](\d+))?", str(spec))
+    if not m:
+        return None
+    lo = int(m.group(1))
+    hi = int(m.group(2) or lo)
+    if not (4 <= lo <= hi <= 12) or hi - lo > 3:
+        return None
+    return list(range(lo, hi + 1))
+
+
+def build_cands(lengths, mode, total, by_score=True):
+    """Кандидаты по всем длинам вперемешку (по кругу); занятые из кеша пропускаем."""
+    per = max(10, total // len(lengths))
+    lists = []
+    for n in lengths:
+        cs = [u for u in scoring.candidates(n, mode, per) if not checker.is_taken(u)]
+        if by_score:
+            cs.sort(key=lambda x: scoring.score(x)[0], reverse=True)
+        lists.append(cs)
+    out = []
+    for i in range(max(map(len, lists), default=0)):
+        out += [cs[i] for cs in lists if i < len(cs)]
+    return out
+
+
 async def run_find(target: Message, user, length, mode):
     uid = user.id
+    quick = length == "quick"
+    lengths = parse_len(length)
+    if not lengths:
+        return await target.answer("📏 Длина — от 4 до 12, диапазон до 4 цифр, например <code>/find 5-6</code>")
+    if quick:
+        mode = "pron"
+    label = f"{lengths[0]}–{lengths[-1]}" if len(lengths) > 1 else str(lengths[0])
     if uid in busy:
         return await target.answer("⏳ Предыдущий поиск ещё печётся, подожди немного 🥐")
     if (left := checker.cooling()):
@@ -149,11 +202,18 @@ async def run_find(target: Message, user, length, mode):
     if wait > 0:
         return await target.answer(f"🥐 Булки ещё не остыли, подожди {int(wait) + 1} сек.")
     last_find[uid] = time.time()
-    cands = scoring.candidates(length, mode, 60)
+    if mode == "pron":  # сначала пробуем готовый свободный ник из пула — это мгновенно
+        got = await take_from_pool(scanner.POOL_LENGTHS if quick else lengths)
+        if got:
+            sc, u, st = got
+            await db.touch(uid, user.full_name, searched=True)
+            cap = (f"🎉 <b>Свободный ник найден!</b>\n\n<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n"
+                   "⚡ из свежей выпечки · проверено только что")
+            await send_card(target, u, sc, st, cap, nick_kb(u, user.id))
+            return await target.answer("Ещё один? 👇", reply_markup=results_kb([], mode, length if quick else label))
+    cands = build_cands(lengths, mode, 40 if quick else 60, by_score=not quick)
     if not cands:
-        return await target.answer("🤷 Для такой длины и стиля нет вариантов. Попробуй другую длину.", reply_markup=len_kb(mode))
-    # лучшие по оценке проверяем первыми — первый же свободный сразу отдаём
-    cands.sort(key=lambda x: scoring.score(x)[0], reverse=True)
+        return await target.answer("🤷 Для такой длины и стиля нет новых вариантов. Попробуй другую длину.", reply_markup=len_kb(mode))
     busy.add(uid)
     try:
         await db.touch(uid, user.full_name, searched=True)
@@ -183,13 +243,13 @@ async def run_find(target: Message, user, length, mode):
             return await target.answer("🧊 Дневной лимит проверок исчерпан, продолжим завтра. Так аккаунт в безопасности.")
         if not best:
             return await target.answer(f"🥲 Проверил {checked}, и всё занято. Булки закончились, жми «Ещё свежий»!",
-                                       reply_markup=results_kb([], mode, length))
+                                       reply_markup=results_kb([], mode, length if quick else label))
         sc, u, st = best
         head = "🎉 <b>Свободный ник найден!</b>" if st == "free" else "💎 <b>Нашёл на Fragment</b>"
         cap = (f"{head}\n\n<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n"
-               f"{MODE_NAMES[mode]} · {length} симв. · проверено {checked}")
+               f"{'⚡ Быстрый поиск' if quick else MODE_NAMES[mode]} · {label} симв. · проверено {checked}")
         await send_card(target, u, sc, st, cap, nick_kb(u, user.id))
-        await target.answer("Ещё один? 👇", reply_markup=results_kb([], mode, length))
+        await target.answer("Ещё один? 👇", reply_markup=results_kb([], mode, length if quick else label))
     finally:
         busy.discard(uid)
 
@@ -199,10 +259,10 @@ async def find(m: Message, command: CommandObject):
     args = (command.args or "").lower().split()
     if not args:
         return await m.answer("🔎 <b>Что ищем?</b>\nВыбери стиль ника 👇", reply_markup=mode_kb())
-    length = next((int(a) for a in args if a.isdigit()), 5)
+    if "quick" in args or "fast" in args:
+        return await run_find(m, m.from_user, "quick", "pron")
+    length = next((a for a in args if re.fullmatch(r"\d+(?:[-–]\d+)?", a)), "5")
     mode = next((a for a in args if a in scoring.MODES), "pron")
-    if not 4 <= length <= 12:
-        return await m.answer("Длина — от 4 до 12.")
     await run_find(m, m.from_user, length, mode)
 
 
@@ -210,13 +270,19 @@ async def find(m: Message, command: CommandObject):
 async def cb_find(c: CallbackQuery):
     _, mode, length = c.data.split(":")
     await c.answer()
-    await run_find(c.message, c.from_user, int(length), mode)
+    await run_find(c.message, c.from_user, length, mode)
+
+
+@dp.callback_query(F.data == "q:go")
+async def cb_quick(c: CallbackQuery):
+    await c.answer()
+    await run_find(c.message, c.from_user, "quick", "pron")
 
 
 @dp.callback_query(F.data.startswith("fm:"))
 async def cb_mode(c: CallbackQuery):
     mode = c.data[3:]
-    await show(c, f"{MODE_NAMES[mode]}\n\n📏 <b>Какой длины ник?</b>\nЧем короче, тем круче (и дороже) 💎", len_kb(mode))
+    await show(c, f"{MODE_NAMES[mode]}\n\n📏 <b>Какой длины ник?</b>\nОдна цифра — точная длина, «5–6» — ищу сразу в двух 👇", len_kb(mode))
 
 
 async def do_rate(target: Message, user, raw: str):
@@ -225,7 +291,7 @@ async def do_rate(target: Message, user, raw: str):
         return await target.answer("⚠️ Ник: 4–32 символа, a–z, 0–9, _, начинается с буквы, без «__» и «_» в конце.")
     await db.touch(user.id, user.full_name, searched=True)
     sc, parts = scoring.score(u)
-    st = await checker.check(u)
+    st = await checker.check(u, fresh=True)
     detail = "\n".join(f"{'+' if p >= 0 else '−'}{abs(p)} {label}" for label, p in parts if p)
     cap = f"<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n{STATUS[st]}\n\n{detail}"
     await send_card(target, u, sc, st, cap, nick_kb(u, user.id))
@@ -310,6 +376,16 @@ async def cb_setok(c: CallbackQuery):
     await c.answer()
 
 
+@dp.message(Command("pool"))
+async def pool_cmd(m: Message):
+    if m.from_user.id != OWNER_ID:
+        return await m.answer("Команда только для владельца бота.")
+    rows = await db.run("SELECT length, COUNT(*) FROM pool GROUP BY length ORDER BY length", fetch=True)
+    stock = ", ".join(f"{n} симв.: {c}" for n, c in rows) or "пусто"
+    await m.answer(f"📦 <b>Склад свободных ников</b>\n{stock}\n\n🤖 <b>Сканеры</b>\n" + "\n".join(scanner.status_lines()) +
+                   f"\n\n🗄 База: {db.BACKEND}")
+
+
 @dp.message(Command("untrap"))
 async def untrap(m: Message, command: CommandObject):
     u = scoring.normalize(command.args or "")
@@ -365,7 +441,7 @@ async def trap_loop():
         await asyncio.sleep(TRAP_INTERVAL)
         try:
             for (u,) in await db.run("SELECT DISTINCT username FROM traps", fetch=True):
-                st = await checker.check(u)
+                st = await checker.check(u, fresh=True)
                 if st not in ("free", "fragment"):
                     continue
                 for uid, old in await db.run("SELECT user_id, state FROM traps WHERE username=?", (u,), fetch=True):
@@ -410,6 +486,7 @@ async def main():
     except Exception:
         logging.exception("set description")
     await checker.start()
+    scanner.start_all(os.getenv("TG_SESSION", ""))
     await start_web()
     asyncio.create_task(trap_loop())
     await dp.start_polling(bot)
