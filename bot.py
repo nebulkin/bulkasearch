@@ -15,6 +15,7 @@ from aiohttp import web
 
 import card
 import db
+import lookup
 import scanner
 import scoring
 from checker import STATUS, Checker
@@ -29,37 +30,65 @@ TRAP_INTERVAL = int(os.getenv("TRAP_INTERVAL", 600))  # сек между про
 busy: set[int] = set()
 last_find: dict[int, float] = {}
 FIND_GAP = int(os.getenv("FIND_GAP", 20))  # сек между поисками одного человека
+lk_busy: set[int] = set()  # кто сейчас ждёт досье
+last_lookup: dict[int, float] = {}
+LOOKUP_GAP = int(os.getenv("LOOKUP_GAP", 4))  # сек между досье одного человека
+BTN_STYLE = os.getenv("BTN_STYLE", "1") != "0"  # цветные кнопки (Bot API 9.4+); BTN_STYLE=0 — выключить, если вдруг мешают
 
 BOT_DESCRIPTION = (
-    "🥐 BulkaSearch — охотник за красивыми Telegram-юзернеймами.\n\n🔎 Находит свободные ники нужной длины: звучные, бренды, слова, паттерны\n📊 Оценивает любой ник и рисует карточку с ценой в TON\n🪤 Ловушка: напишу, как только ник освободится\n⭐ Избранное и личный кабинет\n\nНажми Start и пришли ник — я его оценю!"
+    "🥐 BulkaSearch — охотник за красивыми Telegram-юзернеймами.\n\n"
+    "🕵️ Досье на любой ник: свободен, кто владелец, что на Fragment\n"
+    "🔎 Находит свободные ники нужной длины: звучные, бренды, слова, паттерны\n"
+    "📊 Оценка 0–100 и цена в TON на красивой карточке\n"
+    "🪤 Ловушка: напишу, как только ник освободится\n\n"
+    "Нажми Start и пришли ник — я его изучу!"
 )
-BOT_SHORT = "🥐 Ищу свободные красивые юзернеймы, оцениваю в TON и ловлю освободившиеся. Свежие ники — горячими!"
+BOT_SHORT = "🥐 Досье на любой юзернейм, поиск свободных и ловушки. Свежие ники — горячими!"
 
 HOME = (
     "🥐 <b>BulkaSearch</b>\n"
-    "<i>Свежие юзернеймы — горячими, пока не остыли</i>\n\n"
-    "🔎 Найду свободный ник за пару секунд\n"
-    "📊 Оценю любой ник и нарисую красивую карточку\n"
-    "🪤 Поставлю ловушку и скажу, когда ник освободится\n\n"
-    "Просто пришли ник, например <code>bulka</code> 👇"
+    "<i>свежие юзернеймы — горячими, пока не остыли</i>\n\n"
+    "<blockquote>🕵️ <b>Досье:</b> пришли ник или <code>/find news</code>\n"
+    "🔎 <b>Поиск</b> свободных за пару секунд\n"
+    "📊 <b>Оценка</b> и цена в TON\n"
+    "🪤 <b>Ловушка</b> — скажу, когда освободится</blockquote>\n\n"
+    "Попробуй прямо сейчас: <code>bulka</code> 👇"
 )
 HELP = (
     "🥐 <b>BulkaSearch · команды</b>\n\n"
-    "🔎 /find — поиск кнопками (или <code>/find 5-6 pron</code>)\n"
-    "⚡ /find quick — быстрый поиск свободного (6–7 символов)\n"
-    "📊 /rate <i>name</i> — оценка ника (или просто пришли ник)\n"
-    "🪤 /trap <i>name</i> — ловушка: сообщу, когда ник освободится\n"
-    "👤 /cabinet — кабинет, избранное, ловушки\n"
-    "✏️ /set <i>name</i> — поставить ник на аккаунт (только владелец)\n"
-    "🗑 /unfav <i>name</i> · /untrap <i>name</i> — удалить\n\n"
-    "💡 Ники до 4 символов обычно продаются только на Fragment."
+    "<blockquote>🕵️ <code>/find news</code> — досье на ник: свободен ли, кто владелец, что на Fragment, оценка и цена\n"
+    "🔎 <code>/find</code> — поиск свободного кнопками (или <code>/find 5-6 pron</code>)\n"
+    "⚡ <code>/find quick</code> — быстрый поиск (6–7 символов)\n"
+    "📊 <code>/rate name</code> — то же досье (или просто пришли ник)\n"
+    "🪤 <code>/trap name</code> — ловушка: сообщу, когда ник освободится\n"
+    "👤 <code>/cabinet</code> — кабинет, избранное, ловушки\n"
+    "✏️ <code>/set name</code> — поставить ник на аккаунт (владелец)\n"
+    "🗑 <code>/unfav name</code> · <code>/untrap name</code> — удалить</blockquote>\n\n"
+    "💡 Ники до 4 символов обычно продаются только на Fragment.\n"
+    "ℹ️ Если сам ник совпадает со стилем (<code>word</code>, <code>brand</code>, <code>pron</code>, <code>pattern</code>) — используй <code>/rate</code>."
 )
 MODE_NAMES = {"pron": "🗣 Звучные", "brand": "🏷 Бренды", "word": "📖 Словарные", "pattern": "🔁 Паттерны"}
 BAKING = ("🥐 Достаю свежие ники из печи", "🔥 Греем юзернеймы", "🍞 Замешиваю варианты", "✨ Посыпаем сахарной пудрой")
+KIND_TXT = {"user": ("👤", "пользователь"), "bot": ("🤖", "бот"), "channel": ("📢", "канал"),
+            "group": ("👥", "группа"), "unknown": ("❔", "аккаунт")}
+MEMBERS_TXT = {"channel": "подписчиков", "group": "участников", "bot": "пользователей в месяц"}
 
 
-def btn(text, data):
-    return InlineKeyboardButton(text=text, callback_data=data)
+def esc(s) -> str:
+    return html.escape(str(s))
+
+
+def bar(sc: int, n: int = 10) -> str:
+    k = max(0, min(n, round(sc / 100 * n)))
+    return "▰" * k + "▱" * (n - k)
+
+
+def btn(text, data=None, style=None, url=None):
+    """Кнопка. style: primary / success / danger — цветные кнопки (если клиент не умеет, будет обычная)."""
+    kw = {"style": style} if (style and BTN_STYLE) else {}
+    if url:
+        return InlineKeyboardButton(text=text, url=url, **kw)
+    return InlineKeyboardButton(text=text, callback_data=data, **kw)
 
 
 HOME_BTN = [btn("🥐 В меню", "m:home")]
@@ -67,16 +96,16 @@ HOME_BTN = [btn("🥐 В меню", "m:home")]
 
 def home_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("🔎 Найти свободный", "m:find"), btn("⚡ Быстрый поиск", "q:go")],
-        [btn("📊 Оценить ник", "m:rate"), btn("⭐ Мой кабинет", "m:cab")],
-        [btn("❓ Помощь", "m:help")],
+        [btn("🕵️ Досье на ник", "m:rate", "primary")],
+        [btn("🔎 Найти свободный", "m:find", "primary"), btn("⚡ Быстрый поиск", "q:go", "success")],
+        [btn("⭐ Мой кабинет", "m:cab"), btn("❓ Помощь", "m:help")],
     ])
 
 
 def mode_kb():
     ms = list(MODE_NAMES.items())
     rows = [[btn(n, f"fm:{k}") for k, n in ms[i:i + 2]] for i in range(0, len(ms), 2)]
-    return InlineKeyboardMarkup(inline_keyboard=[[btn("⚡ Быстрый поиск", "q:go")]] + rows + [HOME_BTN])
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("⚡ Быстрый поиск", "q:go", "success")]] + rows + [HOME_BTN])
 
 
 def len_kb(mode):
@@ -87,15 +116,33 @@ def len_kb(mode):
 
 def results_kb(found, mode, length):
     rows = [[btn(f"{'✅' if st == 'free' else '💎'} @{u} · {sc}", f"r:{u}")] for sc, u, st in found[:6]]
-    rows.append([btn("🔄 Ещё свежий", "q:go" if length == "quick" else f"f:{mode}:{length}")] + HOME_BTN)
+    rows.append([btn("🔄 Ещё свежий", "q:go" if length == "quick" else f"f:{mode}:{length}", "primary")] + HOME_BTN)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def nick_kb(u, uid):
-    rows = [[btn("⭐ В избранное", f"fav:{u}"), btn("🪤 Ловушка", f"trap:{u}")]]
-    if uid == OWNER_ID:
-        rows.append([btn("✏️ Поставить ник (userbot)", f"set:{u}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows + [HOME_BTN])
+def nick_kb(u, uid, free=True):
+    """Кнопки под карточкой свободного ника (поиск, оповещения)."""
+    rows = [[btn("⭐ В избранное", f"fav:{u}", "success"), btn("🪤 Ловушка", f"trap:{u}")]]
+    if uid == OWNER_ID and free:
+        rows.append([btn("✏️ Поставить ник (userbot)", f"set:{u}", "primary")])
+    rows.append([btn("🕵️ Досье", f"r:{u}")] + HOME_BTN)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def lookup_kb(u, uid, st):
+    """Кнопки под досье: свободный — забирать, занятый — ловушка; всегда ссылки и «Обновить»."""
+    if st == "free":
+        first = [btn("⭐ В избранное", f"fav:{u}", "success"), btn("🪤 Ловушка", f"trap:{u}")]
+    else:
+        first = [btn("🪤 Ловушка: сообщу, когда освободится", f"trap:{u}", "primary")]
+    rows = [first]
+    if st == "free" and uid == OWNER_ID:
+        rows.append([btn("✏️ Поставить ник (userbot)", f"set:{u}", "primary")])
+    if st != "free":
+        rows.append([btn("⭐ В избранное", f"fav:{u}")])
+    rows.append([btn("🔗 В Telegram", url=f"https://t.me/{u}"), btn("💎 Fragment", url=f"https://fragment.com/username/{u}")])
+    rows.append([btn("🔄 Обновить", f"lk:{u}")] + HOME_BTN)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def show(c: CallbackQuery, text, markup):
@@ -108,10 +155,29 @@ async def show(c: CallbackQuery, text, markup):
     await c.answer()
 
 
-async def send_card(target: Message, u, sc, st, caption, markup):
+def tags_for(u: str) -> list[str]:
+    """Короткие метки для карточки: чем ценен ник."""
+    out = []
+    for label, p in scoring.score(u)[1]:
+        if label == "бренд":
+            out.append("бренд")
+        elif label == "словарное слово":
+            out.append("слово")
+        elif label.startswith("содержит"):
+            out.append("составной")
+        elif label == "палиндром":
+            out.append("палиндром")
+        elif label.startswith("повтор") or label == "один символ":
+            out.append("паттерн")
+    if scoring.is_near(u):
+        out.append("почти-слово")
+    return out[:3]
+
+
+async def send_card(target: Message, u, sc, st, caption, markup, profile=None):
     lo, hi = scoring.estimate_ton(u, sc)
-    png = await asyncio.to_thread(card.render_card, u, sc, st, lo, hi)
-    await target.answer_photo(BufferedInputFile(png, f"{u}.png"), caption=caption, reply_markup=markup)
+    png = await asyncio.to_thread(card.render_card, u, sc, st, lo, hi, profile, tags_for(u))
+    await target.answer_photo(BufferedInputFile(png, f"{u}.jpg"), caption=caption, reply_markup=markup)
 
 
 async def add_fav(uid, u):
@@ -135,10 +201,15 @@ async def add_trap(uid, u):
     return f"🪤 Ловушка на @{u} поставлена (проверка каждые {TRAP_INTERVAL // 60} мин)"
 
 
-@dp.message(Command("start", "help"))
+@dp.message(Command("start"))
 async def start(m: Message):
     await db.touch(m.from_user.id, m.from_user.full_name)
     await m.answer(HOME, reply_markup=home_kb())
+
+
+@dp.message(Command("help"))
+async def help_cmd(m: Message):
+    await m.answer(HELP, reply_markup=InlineKeyboardMarkup(inline_keyboard=[HOME_BTN]))
 
 
 def all_checkers():
@@ -241,6 +312,10 @@ def build_cands(lengths, mode, total, by_score=True):
     return out
 
 
+def found_caption(head, u, sc, foot):
+    return f"{head}\n\n<b>@{u}</b>\n📊 <b>{sc}</b>/100 · {scoring.tier(sc)}\n<code>{bar(sc)}</code>\n<i>{foot}</i>"
+
+
 async def run_find(target: Message, user, length, mode):
     uid = user.id
     quick = length == "quick"
@@ -264,8 +339,7 @@ async def run_find(target: Message, user, length, mode):
         if got:
             sc, u, st = got
             await db.touch(uid, user.full_name, searched=True)
-            cap = (f"🎉 <b>Свободный ник найден!</b>\n\n<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n"
-                   "⚡ из свежей выпечки · проверено только что")
+            cap = found_caption("🎉 <b>Свободный ник найден!</b>", u, sc, "⚡ из свежей выпечки · проверено только что")
             await send_card(target, u, sc, st, cap, nick_kb(u, user.id))
             return await target.answer("Ещё один? 👇", reply_markup=results_kb([], mode, length if quick else label))
     cands = build_cands(lengths, mode, 40 if quick else 60, by_score=not quick)
@@ -306,21 +380,26 @@ async def run_find(target: Message, user, length, mode):
                                        reply_markup=results_kb([], mode, length if quick else label))
         sc, u, st = best
         head = "🎉 <b>Свободный ник найден!</b>" if st == "free" else "💎 <b>Нашёл на Fragment</b>"
-        cap = (f"{head}\n\n<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n"
-               f"{'⚡ Быстрый поиск' if quick else MODE_NAMES[mode]} · {label} симв. · проверено {checked}")
-        await send_card(target, u, sc, st, cap, nick_kb(u, user.id))
+        cap = found_caption(head, u, sc, f"{'⚡ Быстрый поиск' if quick else MODE_NAMES[mode]} · {label} симв. · проверено {checked}")
+        await send_card(target, u, sc, st, cap, nick_kb(u, user.id, st == "free"))
         await target.answer("Ещё один? 👇", reply_markup=results_kb([], mode, length if quick else label))
     finally:
         busy.discard(uid)
 
 
-@dp.message(Command("find"))
+@dp.message(Command("find", "whois"))
 async def find(m: Message, command: CommandObject):
     args = (command.args or "").lower().split()
     if not args:
-        return await m.answer("🔎 <b>Что ищем?</b>\nВыбери стиль ника 👇", reply_markup=mode_kb())
+        return await m.answer("🔎 <b>Что ищем?</b>\nВыбери стиль ника 👇\n\n"
+                              "<i>А чтобы узнать всё про конкретный ник — <code>/find news</code></i>", reply_markup=mode_kb())
     if "quick" in args or "fast" in args:
         return await run_find(m, m.from_user, "quick", "pron")
+    search = any(a in scoring.MODES or re.fullmatch(r"\d+(?:[-–]\d+)?", a) for a in args)
+    if not search:  # /find news — досье на ник
+        if scoring.is_valid(scoring.normalize(args[0])):
+            return await do_lookup(m, m.from_user, args[0])
+        return await m.answer("⚠️ Ник: 4–32 символа, a–z, 0–9, _, начинается с буквы. Например: <code>/find news</code>")
     length = next((a for a in args if re.fullmatch(r"\d+(?:[-–]\d+)?", a)), "5")
     mode = next((a for a in args if a in scoring.MODES), "pron")
     await run_find(m, m.from_user, length, mode)
@@ -345,22 +424,104 @@ async def cb_mode(c: CallbackQuery):
     await show(c, f"{MODE_NAMES[mode]}\n\n📏 <b>Какой длины ник?</b>\nОдна цифра — точная длина, «5–6» — ищу сразу в двух 👇", len_kb(mode))
 
 
-async def do_rate(target: Message, user, raw: str):
+# ---------- досье на ник ----------
+def lookup_caption(u, sc, parts, st, info, frag) -> str:
+    lo, hi = scoring.estimate_ton(u, sc)
+    L = []
+    if st == "free":
+        L += [f"✅ <b>@{u}</b> свободен!", "<i>Забирай, пока не заняли 🏃</i>"]
+    elif st == "fragment":
+        L += [f"💎 <b>@{u}</b> продаётся на Fragment", "<i>Обычным аккаунтом ник не занять — только покупка</i>"]
+    elif info:
+        emoji, kind = KIND_TXT.get(info["kind"], KIND_TXT["unknown"])
+        name = esc(info["name"] or "без имени")
+        flags = (" ✅" if info.get("verified") else "") + (" ⚠️ <b>SCAM</b>" if info.get("scam") else "") + \
+                (" 🚫 <b>FAKE</b>" if info.get("fake") else "") + (" ⭐" if info.get("premium") else "")
+        L += [f"🕵️ <b>Досье · @{u}</b>", "", f"❌ Занят · {emoji} {kind}", f"<b>{name}</b>{flags}"]
+        bio = (info.get("bio") or "").strip()
+        if bio:
+            L.append(f"<blockquote>{esc(bio[:260])}{'…' if len(bio) > 260 else ''}</blockquote>")
+        if info.get("members") is not None and info["kind"] in MEMBERS_TXT:
+            L.append(f"👥 {card.fmt_num(info['members'])} {MEMBERS_TXT[info['kind']]}")
+    elif st == "taken":
+        L += [f"🕵️ <b>Досье · @{u}</b>", "", "❌ Занят",
+              "<i>Владельца не видно: аккаунт скрыт, удалён или ник зарезервирован</i>"]
+    else:
+        L += [f"🕵️ <b>@{u}</b>", "", f"{STATUS.get(st, STATUS['unknown'])}"]
+    if frag and frag["state"] != "none":
+        price = f" · {frag['price']} TON" if frag.get("price") else ""
+        L += ["", {"avail": "🛒 Fragment: продаётся", "auction": "🔨 Fragment: аукцион", "sold": "🏷 Fragment: продан"}[frag["state"]] + price]
+    L += ["", f"📊 <b>{sc}</b>/100 · {scoring.tier(sc)}", f"<code>{bar(sc)}</code>", f"💰 ≈ {lo}–{hi} TON"]
+    if st == "free":
+        detail = "\n".join(f"{'+' if p >= 0 else '−'}{abs(p)} {label}" for label, p in parts if p)
+        if detail:
+            L += ["", f"<blockquote expandable>{esc(detail)}</blockquote>"]
+    return "\n".join(L)
+
+
+async def do_lookup(target: Message, user, raw: str, fresh: bool = False):
+    """Досье на ник: свободен / занят (и кем) / на Fragment + оценка и цена. Любой ввод ника приходит сюда."""
     u = scoring.normalize(raw)
     if not scoring.is_valid(u):
         return await target.answer("⚠️ Ник: 4–32 символа, a–z, 0–9, _, начинается с буквы, без «__» и «_» в конце.")
-    await db.touch(user.id, user.full_name, searched=True)
-    sc, parts = scoring.score(u)
-    st = await smart_check(u, fresh=True)
-    detail = "\n".join(f"{'+' if p >= 0 else '−'}{abs(p)} {label}" for label, p in parts if p)
-    cap = f"<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n{STATUS[st]}\n\n{detail}"
-    await send_card(target, u, sc, st, cap, nick_kb(u, user.id))
+    uid = user.id
+    if uid in lk_busy:
+        return await target.answer("⏳ Предыдущее досье ещё собирается, секунду 🥐")
+    wait = LOOKUP_GAP - (time.time() - last_lookup.get(uid, 0))
+    if wait > 0:
+        return await target.answer(f"🥐 Не так быстро, подожди {int(wait) + 1} сек.")
+    last_lookup[uid] = time.time()
+    lk_busy.add(uid)
+    try:
+        await db.touch(uid, user.full_name, searched=True)
+        msg = await target.answer(f"🕵️ Изучаю <b>@{u}</b>…")
+        sc, parts = scoring.score(u)
+        pst, info = await lookup.profile(u, all_checkers(), fresh=fresh)
+        if pst == "found":
+            st = "taken"
+            checker._mark_taken(u)
+        elif pst in ("notfound", "unknown"):  # владельца нет — спросим, свободен ник или продаётся
+            st = await smart_check(u, fresh=True)
+        else:  # invalid / flood / offline
+            st = pst
+        frag = await lookup.fragment(u, fresh) if st in ("taken", "fragment") else None
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        if st == "invalid":
+            return await target.answer("⚠️ Telegram говорит, что такой ник недопустим.")
+        if st == "offline":
+            return await target.answer("📡 Связь с Telegram пропала, аккаунты переподключаются. Попробуй через минуту 🥐")
+        if st == "flood":
+            left = cooling_left()
+            return await target.answer("🧊 Telegram просит притормозить, поэтому досье пока не собрать. "
+                                       + (f"Загляни через ~{left // 60 + 1} мин." if left else "Попробуй чуть позже."))
+        cap = lookup_caption(u, sc, parts, st, info, frag)
+        await send_card(target, u, sc, st, cap, lookup_kb(u, uid, st), profile=info)
+        return True
+    finally:
+        lk_busy.discard(uid)
+
+
+async def do_rate(target: Message, user, raw: str):
+    await do_lookup(target, user, raw)
 
 
 @dp.callback_query(F.data.startswith("r:"))
 async def cb_rate(c: CallbackQuery):
     await c.answer()
-    await do_rate(c.message, c.from_user, c.data[2:])
+    await do_lookup(c.message, c.from_user, c.data[2:])
+
+
+@dp.callback_query(F.data.startswith("lk:"))
+async def cb_refresh(c: CallbackQuery):
+    await c.answer("Обновляю…")
+    if await do_lookup(c.message, c.from_user, c.data[3:], fresh=True):
+        try:
+            await c.message.delete()  # старую карточку убираем, только если новая уже пришла
+        except Exception:
+            pass
 
 
 @dp.callback_query(F.data.startswith("m:"))
@@ -371,7 +532,10 @@ async def cb_menu(c: CallbackQuery):
     elif act == "find":
         await show(c, "🔎 <b>Что ищем?</b>\nВыбери стиль ника 👇", mode_kb())
     elif act == "rate":
-        await show(c, "📊 <b>Оценка ника</b>\nПришли ник сообщением, например <code>bulka</code>, и я нарисую карточку с оценкой и ценой в TON ✨",
+        await show(c, "🕵️ <b>Досье на ник</b>\n\nПришли ник сообщением, например <code>news</code> или <code>@bulka</code>, "
+                      "либо командой <code>/find news</code>.\n\n"
+                      "<blockquote>✅ свободен или занят\n👤 кто владелец: имя, описание, подписчики\n"
+                      "💎 что на Fragment\n📊 оценка и цена в TON</blockquote>",
                    InlineKeyboardMarkup(inline_keyboard=[HOME_BTN]))
     elif act == "help":
         await show(c, HELP, InlineKeyboardMarkup(inline_keyboard=[HOME_BTN]))
@@ -383,14 +547,14 @@ async def cb_menu(c: CallbackQuery):
 @dp.message(Command("rate"))
 async def rate(m: Message, command: CommandObject):
     if not command.args:
-        return await m.answer("Использование: /rate name")
-    await do_rate(m, m.from_user, command.args.split()[0])
+        return await m.answer("Использование: <code>/rate name</code>")
+    await do_lookup(m, m.from_user, command.args.split()[0])
 
 
 @dp.message(Command("trap"))
 async def trap(m: Message, command: CommandObject):
     if not command.args:
-        return await m.answer("Использование: /trap name")
+        return await m.answer("Использование: <code>/trap name</code>")
     await m.answer(await add_trap(m.from_user.id, scoring.normalize(command.args.split()[0])))
 
 
@@ -400,14 +564,14 @@ async def set_cmd(m: Message, command: CommandObject):
         return await m.answer("Команда только для владельца бота.")
     u = scoring.normalize((command.args or "").split()[0] if command.args else "")
     if not scoring.is_valid(u):
-        return await m.answer("Использование: /set name")
+        return await m.answer("Использование: <code>/set name</code>")
     await m.answer(f"Поставить <b>@{u}</b> на твой аккаунт?\nСтарый ник освободится — его могут занять.", reply_markup=confirm_kb(u))
 
 
 def confirm_kb(u):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"✅ Да, @{u}", callback_data=f"setok:{u}"),
-        InlineKeyboardButton(text="✖️ Отмена", callback_data="setno"),
+        btn(f"✅ Да, @{u}", f"setok:{u}", "success"),
+        btn("✖️ Отмена", "setno", "danger"),
     ]])
 
 
@@ -442,7 +606,8 @@ async def pool_cmd(m: Message):
         return await m.answer("Команда только для владельца бота.")
     rows = await db.run("SELECT length, COUNT(*) FROM pool GROUP BY length ORDER BY length", fetch=True)
     stock = ", ".join(f"{n} симв.: {c}" for n, c in rows) or "пусто"
-    await m.answer(f"📦 <b>Склад свободных ников</b>\n{stock}\n\n🤖 <b>Сканеры</b>\n" + "\n".join(scanner.status_lines()) + "\n" + scanner.alert_line() + "\n" + scanner.seen_line() +
+    await m.answer(f"📦 <b>Склад свободных ников</b>\n<blockquote>{stock}</blockquote>\n\n"
+                   f"🤖 <b>Сканеры</b>\n" + "\n".join(scanner.status_lines()) + "\n\n" + scanner.alert_line() + "\n" + scanner.seen_line() +
                    "\n\n🔑 <b>Аккаунты для поиска</b>\n" + "\n".join(acc_lines()) + f"\n\n🗄 База: {db.BACKEND}")
 
 
@@ -485,10 +650,12 @@ async def cab_view(user):
     _, name, joined, searches = (await db.run("SELECT * FROM users WHERE id=?", (uid,), fetch=True))[0]
     favs = await db.run("SELECT username, score FROM favs WHERE user_id=? ORDER BY score DESC", (uid,), fetch=True)
     traps = await db.run("SELECT username, state FROM traps WHERE user_id=?", (uid,), fetch=True)
+    fav_txt = "\n".join(f"@{u} · {s}/100 <code>{bar(s, 5)}</code>" for u, s in favs) or "пока пусто — жми ⭐ под карточкой"
+    trap_txt = "\n".join(f"@{u} · {STATUS.get(s, s)}" for u, s in traps) or "пока пусто — жми 🪤 под карточкой"
     text = (
-        f"<b>👤 {html.escape(name)}</b>\nС нами с {time.strftime('%d.%m.%Y', time.gmtime(joined))} · поисков: {searches}\n\n"
-        f"<b>⭐ Избранное ({len(favs)})</b>\n" + ("\n".join(f"@{u} — {s}/100" for u, s in favs) or "пусто") +
-        f"\n\n<b>🪤 Ловушки ({len(traps)}/{MAX_TRAPS})</b>\n" + ("\n".join(f"@{u} — {STATUS.get(s, s)}" for u, s in traps) or "пусто")
+        f"👤 <b>{esc(name)}</b>\n<i>с нами с {time.strftime('%d.%m.%Y', time.gmtime(joined))} · поисков: {searches}</i>\n\n"
+        f"⭐ <b>Избранное</b> · {len(favs)}\n<blockquote>{fav_txt}</blockquote>\n\n"
+        f"🪤 <b>Ловушки</b> · {len(traps)}/{MAX_TRAPS}\n<blockquote>{trap_txt}</blockquote>"
     )
     rows = [[btn(f"⭐ @{u} · {s}", f"r:{u}")] for u, s in favs[:8]]
     return text, InlineKeyboardMarkup(inline_keyboard=rows + [HOME_BTN])
@@ -510,21 +677,20 @@ async def cb_trap(c: CallbackQuery):
     await c.answer(await add_trap(c.from_user.id, c.data[5:]), show_alert=True)
 
 
-@dp.message(F.text.regexp(r"^@?[A-Za-z0-9_]{4,32}$"))
+@dp.message(F.text.regexp(r"^(?:https?://)?(?:t\.me/|telegram\.me/)?@?[A-Za-z0-9_]{4,32}$"))
 async def plain_username(m: Message):
-    await do_rate(m, m.from_user, m.text)
+    await do_lookup(m, m.from_user, m.text)
 
 
 async def notify_valuable(u: str, sc: int, who: str = "сканер", test: bool = False):
     """Ценная находка сканера: сразу шлём владельцу карточку с кнопкой «Поставить ник (userbot)»."""
     try:
         lo, hi = scoring.estimate_ton(u, sc)
-        png = await asyncio.to_thread(card.render_card, u, sc, "free", lo, hi)
+        png = await asyncio.to_thread(card.render_card, u, sc, "free", lo, hi, None, tags_for(u))
         head = "🧪 <b>Тест оповещения</b>" if test else "🚨💎 <b>Ценная находка!</b>"
-        cap = (f"{head}\n\n<b>@{u}</b> · {sc}/100 {scoring.tier(sc)}\n"
-               f"🤖 {who} · свободен прямо сейчас, забирай, пока не заняли!")
+        cap = found_caption(head, u, sc, f"🤖 {who} · свободен прямо сейчас, забирай, пока не заняли!")
         kb = InlineKeyboardMarkup(inline_keyboard=[HOME_BTN]) if test else nick_kb(u, OWNER_ID)
-        await bot.send_photo(OWNER_ID, BufferedInputFile(png, f"{u}.png"), caption=cap, reply_markup=kb)
+        await bot.send_photo(OWNER_ID, BufferedInputFile(png, f"{u}.jpg"), caption=cap, reply_markup=kb)
     except Exception:
         logging.exception("notify_valuable")
         if not test:  # не вышло отправить — хотя бы не теряем ник, кладём на склад
@@ -557,7 +723,8 @@ async def trap_loop():
                         continue
                     where = "свободен, беги занимать! 🏃" if st == "free" else "появился на Fragment"
                     try:
-                        await bot.send_message(uid, f"🪤🎉 <b>@{u}</b> {where}")
+                        await bot.send_message(uid, f"🪤🎉 <b>@{u}</b> {where}",
+                                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("🕵️ Открыть досье", f"r:{u}", "primary")]]))
                     except Exception:
                         logging.exception("notify failed")
                     if st == "free":
@@ -584,7 +751,8 @@ async def main():
     await db.init()
     await bot.set_my_commands([
         BotCommand(command="start", description="🥐 Главное меню"),
-        BotCommand(command="find", description="🔎 Найти свободный ник"),
+        BotCommand(command="find", description="🕵️ Досье на ник: /find news · 🔎 поиск свободных"),
+        BotCommand(command="rate", description="📊 Оценка и цена ника"),
         BotCommand(command="cabinet", description="⭐ Мой кабинет"),
         BotCommand(command="help", description="❓ Помощь"),
     ])
