@@ -11,6 +11,7 @@ from telethon.sessions import StringSession
 
 import db
 import scoring
+from checker import LINK_ERRORS, REQ_TIMEOUT, ensure_connected, make_client
 
 LENGTHS = [int(x) for x in os.getenv("SCAN_LENGTHS", "5,5,5,5,6,6,7").split(",") if x.strip().isdigit()] or [6]
 DELAY = float(os.getenv("SCAN_DELAY", 60))  # средняя пауза между проверками одного сканера, сек
@@ -135,7 +136,8 @@ class Scanner:
         today = time.strftime("%Y%m%d")
         if today != self.day:
             self.day, self.day_count = today, 0
-        return self.client is not None and not self.cooling() and self.day_count < DAILY
+        return (self.client is not None and self.client.is_connected()
+                and not self.cooling() and self.day_count < DAILY)
 
     async def _flood(self, seconds: int):
         self.cooldown_until = time.time() + seconds + 300
@@ -146,27 +148,37 @@ class Scanner:
         if not self.ready():
             return "flood"
         async with self.lock:
-            try:
-                ok = await self.client(functions.account.CheckUsernameRequest(username=u))
-                self.day_count += 1
-                self.last_used = time.time()
-                await asyncio.sleep(random.uniform(1.2, 2.2))
-                return "free" if ok else "taken"
-            except errors.UsernameInvalidError:
-                return "invalid"
-            except errors.UsernameOccupiedError:
-                return "taken"
-            except errors.FloodWaitError as e:
-                logging.warning("scanner %s: FloodWait %s сек (живой поиск)", self.name, e.seconds)
-                await self._flood(e.seconds)
-                return "flood"
-            except errors.RPCError as e:
-                msg = getattr(e, "message", "") or str(e)
-                if "PURCHASE_AVAILABLE" in msg:
-                    return "fragment"
-                if "OCCUPIED" in msg:
+            if not await ensure_connected(self.client, 25):
+                return "offline"
+            for attempt in (1, 2):
+                try:
+                    ok = await asyncio.wait_for(
+                        self.client(functions.account.CheckUsernameRequest(username=u)), REQ_TIMEOUT)
+                    self.day_count += 1
+                    self.last_used = time.time()
+                    await asyncio.sleep(random.uniform(1.2, 2.2))
+                    return "free" if ok else "taken"
+                except errors.UsernameInvalidError:
+                    return "invalid"
+                except errors.UsernameOccupiedError:
                     return "taken"
-                return "unknown"
+                except errors.FloodWaitError as e:
+                    logging.warning("scanner %s: FloodWait %s сек (живой поиск)", self.name, e.seconds)
+                    await self._flood(e.seconds)
+                    return "flood"
+                except errors.RPCError as e:
+                    msg = getattr(e, "message", "") or str(e)
+                    if "PURCHASE_AVAILABLE" in msg:
+                        return "fragment"
+                    if "OCCUPIED" in msg:
+                        return "taken"
+                    return "unknown"
+                except LINK_ERRORS as e:
+                    logging.warning("scanner %s: обрыв связи при живой проверке (%s), попытка %d",
+                                    self.name, type(e).__name__, attempt)
+                    if attempt == 2 or not await ensure_connected(self.client, 25):
+                        break
+            return "offline"
 
     def _candidate(self):
         # слова и бренды целиком — самые ценные; «почти-слова» (слово с одной изменённой буквой) — запасной
@@ -193,7 +205,7 @@ class Scanner:
         await asyncio.sleep(start_delay)
         try:
             self.state = "подключается…"
-            client = TelegramClient(StringSession(self.session), int(os.environ["API_ID"]), os.environ["API_HASH"])
+            client = make_client(self.session)
             await asyncio.wait_for(client.connect(), 90)
             if not await asyncio.wait_for(client.is_user_authorized(), 90):
                 self.state = "сессия недействительна ❌"
@@ -210,6 +222,13 @@ class Scanner:
         while True:
             u = None
             try:
+                if not client.is_connected():  # Telethon сам больше не пробует — переподключаем вручную
+                    self.state = "нет связи, переподключаюсь… 📡"
+                    if not await ensure_connected(client):
+                        await asyncio.sleep(30)
+                        continue
+                    logging.info("scanner %s: связь восстановлена", self.name)
+                    self.state = "подключён, подбирает ники…"
                 left = self.cooling()
                 if left:
                     self.state = f"FloodWait, спит до {time.strftime('%H:%M', time.gmtime(self.cooldown_until))} UTC 🧊"
@@ -237,7 +256,7 @@ class Scanner:
                     continue
                 self.state = "ищет 🔎"
                 async with self.lock:
-                    ok = await client(functions.account.CheckUsernameRequest(username=u))
+                    ok = await asyncio.wait_for(client(functions.account.CheckUsernameRequest(username=u)), REQ_TIMEOUT)
                 self.last_used = time.time()
                 self.checked += 1
                 self.day_count += 1
@@ -271,6 +290,9 @@ class Scanner:
                 return logging.error("scanner %s: аккаунт отключён", self.name)
             except errors.RPCError:
                 await asyncio.sleep(120)  # PURCHASE_AVAILABLE и прочее — просто идём дальше
+            except LINK_ERRORS as e:
+                logging.warning("scanner %s: обрыв связи (%s)", self.name, type(e).__name__)
+                await asyncio.sleep(10)  # в начале цикла связь будет восстановлена
             except Exception:
                 logging.exception("scanner %s", self.name)
                 await asyncio.sleep(120)
