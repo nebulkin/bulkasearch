@@ -150,6 +150,11 @@ def any_ready() -> bool:
     return any(c.ready() for c in all_checkers())
 
 
+def any_link() -> bool:
+    """Есть ли хоть один аккаунт с живой связью с Telegram."""
+    return any(c.client is not None and c.client.is_connected() for c in all_checkers())
+
+
 def cooling_left() -> int:
     """0 — хотя бы один аккаунт может работать; иначе сколько секунд до ближайшего."""
     cs = all_checkers()
@@ -162,22 +167,29 @@ def acc_lines():
     out = []
     for c in all_checkers():
         left = c.cooling()
+        if c.client is not None and not c.client.is_connected():
+            out.append(f"• {c.name}: нет связи с Telegram 📡 (переподключаюсь)")
+            continue
         out.append(f"• {c.name}: " + (f"отдыхает ещё ~{left // 60 + 1} мин 🧊" if left else "готов ✅"))
     return out
 
 
 async def smart_check(u: str, fresh: bool = False) -> str:
-    """Проверка ника любым свободным аккаунтом (по кругу, самым отдохнувшим). Уснул один — берём другой."""
+    """Проверка ника любым свободным аккаунтом (по кругу, самым отдохнувшим). Уснул или потерял связь один — берём другой."""
     if not fresh and checker.is_taken(u):
         return "taken"
     tried = set()
+    offline = False
     while True:
         c = min((x for x in all_checkers() if x.ready() and id(x) not in tried),
                 key=lambda x: x.last_used, default=None)
         if c is None:
-            return "flood"
+            return "offline" if (offline or not any_link()) else "flood"
         tried.add(id(c))
         st = await c.check(u, True)
+        if st == "offline":
+            offline = True
+            continue  # у этого аккаунта пропала связь — пробуем следующий
         if st == "flood":
             continue  # этот аккаунт отдыхает — пробуем следующий
         if st == "taken":
@@ -195,7 +207,7 @@ async def take_from_pool(lengths):
         st = await smart_check(u, fresh=True)
         if st == "free":
             return sc, u, st
-        if st == "flood":
+        if st in ("flood", "offline"):
             break
     return None
 
@@ -263,11 +275,12 @@ async def run_find(target: Message, user, length, mode):
     try:
         await db.touch(uid, user.full_name, searched=True)
         msg = await target.answer(f"{BAKING[0]}…")
-        hit, fallback, checked = None, None, 0
+        hit, fallback, checked, down = None, None, 0, None
         for u in cands:
             st = await smart_check(u)
             checked += 1
-            if st == "flood":
+            if st in ("flood", "offline"):
+                down = st
                 break
             if st == "free":
                 hit = (scoring.score(u)[0], u, st)
@@ -281,6 +294,8 @@ async def run_find(target: Message, user, length, mode):
                     pass
         await msg.delete()
         best = hit or fallback
+        if not best and down == "offline":
+            return await target.answer("📡 Связь с Telegram пропала, аккаунты переподключаются. Попробуй через минуту 🥐")
         if not best and (left := cooling_left()):
             return await target.answer("🧊 Telegram просит притормозить, я ставлю поиск на паузу, чтобы не рисковать аккаунтом. "
                                        f"Загляни через ~{left // 60 + 1} мин.")
