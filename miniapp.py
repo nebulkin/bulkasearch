@@ -15,6 +15,7 @@ from aiohttp import web
 
 import db
 import lookup
+import scanner
 import scoring
 
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bulkasearch.vercel.app")
@@ -158,7 +159,8 @@ async def setup(app, B, token):
     @api
     async def h_find(u, body):
         uid = u["id"]
-        mode = body.get("mode") if body.get("mode") in scoring.MODES else "pron"
+        quick = body.get("length") == "quick"  # быстрый поиск как в боте: 6–7 символов, звучные, склад сканеров
+        mode = "pron" if quick else (body.get("mode") if body.get("mode") in scoring.MODES else "pron")
         lengths = B.parse_len(str(body.get("length", "5")))
         if not lengths:
             return {"error": "bad_len"}
@@ -172,11 +174,11 @@ async def setup(app, B, token):
         try:
             await db.touch(uid, u.get("first_name", ""), searched=True)
             if mode == "pron":  # сначала готовые находки сканеров, это мгновенно
-                got = await B.take_from_pool(lengths)
+                got = await B.take_from_pool(scanner.POOL_LENGTHS if quick else lengths)
                 if got:
                     return {"nick": got[1], "checked": 0}
             checked = 0
-            for c in B.build_cands(lengths, mode, 20):
+            for c in B.build_cands(lengths, mode, 30 if quick else 20, by_score=not quick):
                 st = await B.smart_check(c)
                 checked += 1
                 if st in ("flood", "offline"):
