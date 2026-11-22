@@ -1,5 +1,5 @@
 """BulkaSearch Mini App: сервер (маршруты aiohttp) + проверка подписи Telegram.
-Страница лежит рядом в miniapp.html. Всю «умную» работу (проверка ников, оценка, избранное, ловушки)
+Сама страница лежит отдельно на Vercel (index.html). Всю «умную» работу (проверка ников, оценка, избранное, ловушки)
 берём из bot.py, ничего не дублируя: B — это модуль bot.py, передаётся из start_web()."""
 import base64
 import hashlib
@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import time
-from pathlib import Path
 from urllib.parse import parse_qsl
 
 from aiogram.types import MenuButtonWebApp, WebAppInfo
@@ -18,8 +17,7 @@ import db
 import lookup
 import scoring
 
-HTML = Path(__file__).with_name("miniapp.html")
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bulkasearch.onrender.com/app")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bulkasearch.vercel.app")
 _last: dict = {}  # (user_id, вид) -> время последнего запроса
 _busy: set = set()  # кто сейчас ищет
 
@@ -50,7 +48,7 @@ def _wait(uid, kind, gap):
     return 0
 
 
-ORIGIN = os.getenv("WEBAPP_ORIGIN", "*")  # адрес сайта на Vercel, например https://bulka-app.vercel.app
+ORIGIN = os.getenv("WEBAPP_ORIGIN", "https://bulkasearch.vercel.app")  # откуда разрешены запросы (сайт на Vercel)
 
 
 @web.middleware
@@ -90,11 +88,6 @@ async def setup(app, B, token):
 
     async def exists(table, uid, nick):
         return bool(await db.run(f"SELECT 1 FROM {table} WHERE user_id=? AND username=?", (uid, nick), fetch=True))
-
-    async def page(_):
-        if not HTML.exists():
-            return web.Response(text="miniapp.html не найден в репозитории", status=404)
-        return web.FileResponse(HTML, headers={"Cache-Control": "no-cache"})
 
     async def dossier(uid, nick, fresh=False):
         sc, parts = scoring.score(nick)
@@ -194,7 +187,6 @@ async def setup(app, B, token):
         finally:
             _busy.discard(uid)
 
-    app.router.add_get("/app", page)
     for path, h in (("lookup", h_lookup), ("me", h_me), ("fav", h_fav), ("trap", h_trap), ("find", h_find)):
         app.router.add_post(f"/api/{path}", h)
     try:  # кнопка-меню рядом с полем ввода открывает приложение
