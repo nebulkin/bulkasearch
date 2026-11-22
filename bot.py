@@ -10,12 +10,13 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-                           InlineKeyboardMarkup, Message)
+                           InlineKeyboardMarkup, Message, WebAppInfo)
 from aiohttp import web
 
 import card
 import db
 import lookup
+import miniapp
 import scanner
 import scoring
 from checker import STATUS, Checker
@@ -96,6 +97,8 @@ HOME_BTN = [btn("🥐 В меню", "m:home")]
 
 def home_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📱 Открыть приложение", web_app=WebAppInfo(url=miniapp.WEBAPP_URL),
+                              **({"style": "success"} if BTN_STYLE else {}))],
         [btn("🕵️ Досье на ник", "m:rate", "primary")],
         [btn("🔎 Найти свободный", "m:find", "primary"), btn("⚡ Быстрый поиск", "q:go", "success")],
         [btn("⭐ Мой кабинет", "m:cab"), btn("❓ Помощь", "m:help")],
@@ -742,6 +745,10 @@ async def start_web():
     app = web.Application()
     app.router.add_get("/", ok)
     app.router.add_get("/health", ok)
+    try:  # mini app (страница на Vercel): API + кнопка-меню; если сломается, бот всё равно работает
+        await miniapp.setup(app, __import__("sys").modules[__name__], os.environ["BOT_TOKEN"])
+    except Exception:
+        logging.exception("miniapp setup")
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
